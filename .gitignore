@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Pipeline outputs — should never be in git
+test_dataset/
+dataset/
+output/
+*.jsonl
+!test_queue.jsonl
+!**/test_queue.jsonl
+
+# Joern / CPG caches (large binary files)
+.cache/
+cpg.bin
+*.bin
+
+# Local artifacts and logs
+*.log
+smoke.log
+.DS_Store
+
+# Editor scratch
+.vscode/
+.idea/
+*.swp
