@@ -1,0 +1,17 @@
+{
+  "repo": "example/libfoo",
+  "cve": "CVE-2024-00001",
+  "cwe": ["CWE-120"],
+  "commit_vuln": "aaaaaaaa",
+  "commit_fix":  "bbbbbbbb",
+  "version": "vulnerable",
+  "file": "src/parser.c",
+  "function": "parse_header",
+  "patched_lines": [58, 59, 63],
+  "sinks": [
+    {"line": 63, "api": "memcpy", "arg_index": 2, "source": "cwe_list"}
+  ],
+  "sources": [
+    {"line": 52, "kind": "user_input", "expr": "input_buf"}
+  ]
+}
