@@ -33,6 +33,7 @@ from pathlib import Path
 import networkx as nx  # pip install networkx
 
 from .cpg_cache import CPGHandle
+from ._cpg_loader import load_cpg_graph
 from .find_candidates import Step1Result, CandidateFunction
 
 log = logging.getLogger(__name__)
@@ -61,62 +62,46 @@ def load_cpg_subgraph(
     handle: CPGHandle,
     step1: Step1Result,
 ) -> _RawCPG:
-    """Read the Joern GraphSON export and return a subgraph containing only
+    """Read the Joern graphml export and return a subgraph containing only
     nodes owned by candidate functions. Cross-function CALL edges whose
     target is a candidate method are preserved; other outbound CALL edges
-    are dropped (we don't care about calls to non-candidates for Step 2 —
-    those get re-added in Step 3 if sinks land in them)."""
+    are dropped (we don't care about calls to non-candidates for Step 2)."""
 
     want_methods = {cf.method_full_name for cf in step1.candidate_functions}
     if not want_methods:
         raise ValueError("step1 has no candidate functions to build a graph for")
 
-    G = nx.MultiDiGraph()
+    full_graph = _load_cpg_graphml(handle.graph_dir)
+
     method_node_by_name: dict[str, str] = {}
     owner: dict[str, str] = {}
 
-    # --- Pass 1a: scan every graph file, collect METHOD nodes we care about. --
-    all_vertices: list[dict] = []
-    all_edges: list[dict] = []
-    for jf in sorted(handle.graph_dir.glob("*.json")):
-        try:
-            data = json.loads(jf.read_text())
-        except json.JSONDecodeError:
-            log.warning("skipping unreadable graph file: %s", jf)
-            continue
-        all_vertices.extend(_vertices(data))
-        all_edges.extend(_edges(data))
+    def _first(attrs: dict, *keys: str, default=""):
+        for k in keys:
+            if k in attrs and attrs[k] not in (None, ""):
+                return attrs[k]
+        return default
 
-    # Index vertices for later lookup.
-    vertex_by_id: dict[str, dict] = {_vid(v, "id"): v for v in all_vertices}
-
-    # Find METHOD nodes for our candidates.
-    for v in all_vertices:
-        if v.get("label") != "METHOD":
+    # --- Find METHOD nodes for our candidates ----------------------------
+    for nid, attrs in full_graph.nodes(data=True):
+        if attrs.get("_label") != "METHOD":
             continue
-        props = _flat_props(v)
-        full_name = props.get("fullName") or props.get("name", "")
+        full_name = str(_first(attrs, "FULL_NAME", "fullName",
+                               default=_first(attrs, "NAME", "name", default="")))
         if full_name in want_methods:
-            nid = _vid(v, "id")
-            method_node_by_name[full_name] = nid
-            owner[nid] = full_name
+            method_node_by_name[full_name] = str(nid)
+            owner[str(nid)] = full_name
 
     missing = want_methods - method_node_by_name.keys()
     if missing:
-        # Not fatal — a candidate might have been added to step1 by a caller
-        # but absent from this commit's CPG (e.g. #ifdef'd out). Log and skip.
         log.warning("candidate methods not found in CPG: %s", sorted(missing)[:5])
 
-    # --- Pass 1b: propagate ownership via CONTAINS + AST edges -------------
-    # METHOD --CONTAINS--> every descendant is Joern's documented invariant.
-    # We union with AST as a safety net (some Joern versions don't emit
-    # CONTAINS consistently across every language front-end).
+    # --- Propagate ownership via CONTAINS + AST edges --------------------
     adj: dict[str, list[str]] = defaultdict(list)
-    for e in all_edges:
-        if e.get("label") in ("CONTAINS", "AST"):
-            adj[_vid(e, "outV")].append(_vid(e, "inV"))
+    for u, v, k in full_graph.edges(keys=True):
+        if k in ("CONTAINS", "AST"):
+            adj[str(u)].append(str(v))
 
-    # method_node_by_name maps full_name -> nid. Iterate with the correct order.
     for full_name, method_nid in list(method_node_by_name.items()):
         stack = [method_nid]
         while stack:
@@ -126,40 +111,27 @@ def load_cpg_subgraph(
                     owner[child] = full_name
                     stack.append(child)
 
-    # --- Pass 1c: add owned vertices to G ---------------------------------
+    # --- Build the subgraph: copy owned nodes, filter edges --------------
+    G = nx.MultiDiGraph()
     for nid, full_name in owner.items():
-        v = vertex_by_id.get(nid)
-        if v is None:
+        attrs = full_graph.nodes.get(nid, {})
+        if not attrs:
             continue
-        props = _flat_props(v)
-        G.add_node(
-            nid,
-            _label=v.get("label", "UNKNOWN"),
-            function=full_name,
-            **{k: props[k] for k in props if k not in ("_label", "function")},
-        )
+        # Copy all attributes; add `function` (our tag) on top.
+        copy_attrs = {k: v for k, v in attrs.items() if k != "function"}
+        G.add_node(nid, function=full_name, **copy_attrs)
 
-    # --- Pass 1d: add edges where both endpoints are owned ----------------
-    # Special case for CALL edges: Joern emits these from a CALL node to the
-    # target METHOD node. The METHOD target might be a non-candidate (library
-    # function, or a candidate we didn't include). Keep the edge only if the
-    # target is in our method set — otherwise drop it; external calls are
-    # tracked via the `called_function` attribute on the statement node instead.
     kept = 0
-    for e in all_edges:
-        u, v = _vid(e, "outV"), _vid(e, "inV")
-        lab = e.get("label", "")
-        u_in = u in owner
-        v_in = v in owner
-        if lab == "CALL":
-            # For CALL edges, only keep if both endpoints are in our subgraph.
-            # CALL edge targets in Joern point at METHOD nodes, so v_in means
-            # "the callee is a candidate."
+    for u, v, k, attrs in full_graph.edges(keys=True, data=True):
+        us, vs = str(u), str(v)
+        u_in, v_in = us in owner, vs in owner
+        if k == "CALL":
+            # Cross-function calls: keep only if target is also a candidate.
             if u_in and v_in:
-                G.add_edge(u, v, key=lab, edge_type=lab)
+                G.add_edge(us, vs, key=k, edge_type=k, **attrs)
                 kept += 1
         elif u_in and v_in:
-            G.add_edge(u, v, key=lab, edge_type=lab)
+            G.add_edge(us, vs, key=k, edge_type=k, **attrs)
             kept += 1
 
     log.info(
@@ -170,85 +142,9 @@ def load_cpg_subgraph(
     return _RawCPG(graph=G, method_node_by_name=method_node_by_name, owner=owner)
 
 
-# ---------------------------------------------------------------------------
-# GraphSON plumbing (shared with find_candidates.py; duplicated here to keep
-# this module self-contained — Step 1's helpers are private on purpose).
-# ---------------------------------------------------------------------------
-
-def _vertices(data: dict) -> list[dict]:
-    if "vertices" in data:
-        return data["vertices"]
-    return data.get("@value", {}).get("vertices", [])
-
-
-def _edges(data: dict) -> list[dict]:
-    if "edges" in data:
-        return data["edges"]
-    return data.get("@value", {}).get("edges", [])
-
-
-def _unwrap(v):
-    """GraphSON v3 wraps typed values as {"@type": "g:Int64", "@value": 42}.
-    Return the bare value; plain values pass through unchanged."""
-    if isinstance(v, dict) and "@value" in v and "@type" in v:
-        return _unwrap(v["@value"])
-    if isinstance(v, list):
-        return [_unwrap(x) for x in v]
-    return v
-
-
-def _vid(obj: dict, key: str) -> str:
-    """Read a vertex/edge id field as a string, handling GraphSON v1 and v3."""
-    return str(_unwrap(obj.get(key)))
-
-
-def _flat_props(vertex: dict) -> dict:
-    """Flatten GraphSON properties to name->value. See find_candidates._flat_props
-    for the full format breakdown — this must stay in sync with that function."""
-    out: dict = {}
-    for k, raw in vertex.get("properties", {}).items():
-        val = _extract_property_value(raw)
-        if val is None:
-            continue
-        out[k] = val
-        # Alias SCREAMING_SNAKE (and all-caps single words) -> camelCase so
-        # code written against either works. Examples:
-        #   FULL_NAME  -> fullName
-        #   NAME       -> name
-        #   FILENAME   -> filename
-        if k.isupper():
-            if "_" in k:
-                parts = k.lower().split("_")
-                camel = parts[0] + "".join(p.capitalize() for p in parts[1:])
-            else:
-                camel = k.lower()
-            out.setdefault(camel, val)
-    return out
-
-
-def _extract_property_value(raw):
-    """Unwrap a GraphSON v3 property to its Python value. Handles:
-      - list -> take first element
-      - {"@type": "g:VertexProperty", "@value": {...}} -> descend
-      - {"@type": "g:List", "@value": [X]} -> take first element
-      - flat {"id": ..., "value": Y} -> Y
-      - {"@type": "g:Int32", "@value": 6} and friends -> 6
-    Returns None for empty properties."""
-    v = raw
-    if isinstance(v, list):
-        if not v:
-            return None
-        v = v[0]
-    if isinstance(v, dict) and v.get("@type") == "g:VertexProperty":
-        v = v.get("@value")
-    if isinstance(v, dict) and "value" in v and "@type" not in v:
-        return _unwrap(v["value"])
-    if isinstance(v, dict) and v.get("@type") == "g:List":
-        items = v.get("@value", [])
-        if not items:
-            return None
-        return _unwrap(items[0])
-    return _unwrap(v)
+def _load_cpg_graphml(graph_dir: Path) -> "nx.MultiDiGraph":
+    """Load the Joern neo4jcsv export in graph_dir into a NetworkX MultiDiGraph."""
+    return load_cpg_graph(graph_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -761,14 +657,14 @@ def augment_param_bindings(
                 src_stmt = _lift_to_stmt_in(stmt_graph, arg)
                 if src_stmt is None:
                     continue
-                # Use per-arg key so multiple args from the same call statement
-                # (all lifting to the same src_stmt) each get their own edge.
-                key = f"PARAM_BIND_{idx}"
-                if stmt_graph.has_edge(src_stmt, callee_entry, key=key):
+                # One edge per argument index — use idx in the key so that
+                # multiple args at the same call site each get their own edge.
+                pb_key = f"PARAM_BIND_{idx}"
+                if stmt_graph.has_edge(src_stmt, callee_entry, key=pb_key):
                     continue
                 stmt_graph.add_edge(
                     src_stmt, callee_entry,
-                    key=key,
+                    key=pb_key,
                     edge_type="PARAM_BIND",
                     arg_index=idx,
                 )

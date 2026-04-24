@@ -12,8 +12,8 @@ Design choices
 * We check out the commit into a *worktree*, not the main repo, so the
   user's HEAD is never disturbed and multiple commits can be processed in
   parallel.
-* We export the CPG as a JSON graph (all edge types). Downstream steps
-  load this JSON into NetworkX — no Joern runtime dependency after build.
+* We export the CPG as neo4jcsv (all edge types). Downstream steps
+  load these CSV files into NetworkX — no Joern runtime dependency after build.
 * Failures are logged and raise CPGBuildError; callers decide whether to
   skip the patch or abort.
 """
@@ -116,6 +116,14 @@ def get_or_build_cpg(
     #    Worktree is lighter than a full clone and doesn't touch the user's HEAD.
     if not worktree.exists():
         log.info("creating worktree for %s @ %s", repo_path.name, commit[:8])
+        # Prune stale worktree registry entries first. Without this, if a
+        # previous cache run's worktree dir was deleted (or we wiped the
+        # CPG cache), git still remembers it was registered and refuses to
+        # add a new one at the same path. `prune` is a safe idempotent op.
+        subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=repo_path, capture_output=True,
+        )
         _run(["git", "worktree", "add", "--detach", str(worktree), commit],
              cwd=repo_path)
 
@@ -127,27 +135,28 @@ def get_or_build_cpg(
         "--output", str(handle.cpg_bin),
     ])
 
-    # 3. joern-export: cpg.bin -> JSON graph with all edge kinds
-    #    'all' = AST + CFG + CDG + DDG + CALL + ARGUMENT + others.
-    #    We keep them all and filter downstream — much cheaper than re-exporting.
-    #    NOTE: joern-export refuses to run if --out already exists, so we do
-    #    NOT mkdir the graph_dir here. Joern creates it.
+    # 3. joern-export: cpg.bin -> neo4jcsv.
+    #    graphml is not used: on large real-world CPGs Joern crashes in its
+    #    own xmlFormatInPlace step when Java's SAX parser hits the default
+    #    100 000-char entity size limit on a long `code` property.
+    #    neo4jcsv writes flat CSV files with no such constraint.
+    #    NB: joern-export refuses to run if --out already exists.
     log.info("joern-export...")
     if handle.graph_dir.exists():
         shutil.rmtree(handle.graph_dir)
     _run([
         "joern-export", str(handle.cpg_bin),
         "--repr", "all",
-        "--format", "graphson",
+        "--format", "neo4jcsv",
         "--out", str(handle.graph_dir),
     ])
 
-    # 4. Sanity check: at least one non-empty JSON file in graph/
-    exported = list(handle.graph_dir.glob("*.json"))
+    # 4. Sanity check: at least one non-empty node data file exists.
+    exported = list(handle.graph_dir.glob("nodes_*_data.csv"))
     if not exported or all(p.stat().st_size == 0 for p in exported):
         raise CPGBuildError(f"joern-export produced no usable output in {handle.graph_dir}")
 
-    # 5. Write a tiny manifest so we can debug stale caches later.
+    # 5. Manifest so as to debug stale caches later.
     (cache_dir / "manifest.json").write_text(json.dumps({
         "repo_path": str(repo_path.resolve()),
         "commit": commit,

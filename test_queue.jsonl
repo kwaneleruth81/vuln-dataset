@@ -1,0 +1,1 @@
+{"patch_id": "curl/CVE-2023-38545", "repo_url": "https://github.com/curl/curl", "commit_vuln": "09e25b9d94f4106eac8ca3a43b221bdc66f405e4", "commit_fix": "fb4415d8aee6c1045be932a34fe6107c2f5ed147", "cve": "CVE-2023-38545", "cwes": ["CWE-122", "CWE-787", "CWE-119"]}

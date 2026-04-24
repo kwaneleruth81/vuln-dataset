@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Iterable, Literal
 
 from .cpg_cache import CPGHandle, get_or_build_cpg
+from ._cpg_loader import load_cpg_graph
 
 log = logging.getLogger(__name__)
 
@@ -79,12 +80,25 @@ _HUNK_RE = re.compile(
 
 
 def _git_diff(repo: Path, commit_vuln: str, commit_fix: str) -> str:
-    """Return the unified diff between two commits, with zero context lines
-    trimmed out to the default of 3 — we need context to know which lines
-    the removed/added lines sit near."""
+    """Return the unified diff between two commits.
+
+    Robustness flags:
+      * errors="replace" — some real-world commits touch binary or non-UTF-8
+        text files, and the default strict UTF-8 decoding explodes. We replace
+        bad bytes with U+FFFD since we only parse hunk headers and +/-
+        prefixes, not the actual line content.
+      * --binary-files=without-match via the text-only diff path (no binary
+        patches in output) — we don't need the binary blob content anyway.
+    """
     res = subprocess.run(
-        ["git", "diff", "--unified=3", f"{commit_vuln}..{commit_fix}"],
+        ["git", "diff", "--unified=3",
+         # Omit binary file diffs entirely. We couldn't parse them usefully,
+         # and they inflate diff size enormously on CVEs that touch, e.g.,
+         # test fixtures.
+         "--no-textconv",
+         f"{commit_vuln}..{commit_fix}"],
         cwd=repo, capture_output=True, text=True, check=True,
+        errors="replace",
     )
     return res.stdout
 
@@ -246,6 +260,11 @@ def _fill_vuln_context_for_pure_additions(
 # Sub-task B: load Joern CPG and extract the call graph + function metadata
 # ---------------------------------------------------------------------------
 
+def _load_cpg_graphml(graph_dir: Path) -> "nx.MultiDiGraph":
+    """Load the Joern neo4jcsv export in graph_dir into a NetworkX MultiDiGraph."""
+    return load_cpg_graph(graph_dir)
+
+
 @dataclass
 class _MethodInfo:
     """Minimal info we need about every function in the CPG."""
@@ -259,111 +278,97 @@ class _MethodInfo:
 def load_methods_and_callgraph(
     handle: CPGHandle,
 ) -> tuple[dict[str, _MethodInfo], dict[str, set[str]], dict[str, set[str]]]:
-    """Load the exported CPG and extract:
+    """Load the exported graphml CPG and extract:
         methods    : full_name -> _MethodInfo
         callers    : full_name -> {full_names of methods that CALL it}
         callees    : full_name -> {full_names of methods IT calls}
 
-    We walk every graph file once. METHOD nodes give us methods; CALL nodes
-    with a 'methodFullName' property give us the target of each call; the
-    enclosing method of a CALL is found by walking AST parent edges back to
-    the containing METHOD. Joern exposes that via the 'CONTAINS' edge from
-    METHOD -> child nodes, so we build a reverse map in one pass.
-    """
+    METHOD nodes give us methods; CALL nodes with a 'METHOD_FULL_NAME' / or
+    'methodFullName' property give us each call's target. The enclosing
+    method of a call is found via CONTAINS / AST edge BFS from each METHOD."""
+
+    G = _load_cpg_graphml(handle.graph_dir)
+
     methods: dict[str, _MethodInfo] = {}
     callers: dict[str, set[str]] = {}
     callees: dict[str, set[str]] = {}
 
-    # node_id -> owning method full_name (derived from CONTAINS / AST edges)
+    # node_id -> owning method full_name
     node_owner: dict[str, str] = {}
-    # temp storage of call-node info until we can resolve its owner
-    pending_calls: list[tuple[str, str]] = []  # (call_node_id, target_full_name)
+    pending_calls: list[tuple[str, str]] = []   # (call_node_id, target_full_name)
 
     worktree_prefix = str(handle.worktree.resolve()) + "/"
 
-    for jf in sorted(handle.graph_dir.glob("*.json")):
-        try:
-            data = json.loads(jf.read_text())
-        except json.JSONDecodeError:
-            log.warning("skipping unreadable graph file: %s", jf)
-            continue
+    def _first(attrs: dict, *keys: str, default=""):
+        """Attempt multiple attribute names for a property; Joern's graphml
+        uses SCREAMING_SNAKE (FULL_NAME, LINE_NUMBER, METHOD_FULL_NAME) but
+        older versions used camelCase (fullName, lineNumber, methodFullName)."""
+        for k in keys:
+            if k in attrs and attrs[k] not in (None, ""):
+                return attrs[k]
+        return default
 
-        vertices = _vertices(data)
-        edges = _edges(data)
+    # Pass 1: collect METHOD nodes, stash CALL targets for later resolution.
+    for nid, attrs in G.nodes(data=True):
+        label = attrs.get("_label", "")
+        if label == "METHOD":
+            full_name = str(_first(attrs, "FULL_NAME", "fullName",
+                                   default=_first(attrs, "NAME", "name", default="")))
+            short = str(_first(attrs, "NAME", "name", default=""))
+            if not full_name or full_name.startswith("<operator>"):
+                continue
+            if short in ("<global>", "<includes>") or \
+               full_name.endswith(":<global>") or \
+               full_name.endswith(":<includes>"):
+                continue
+            fname = str(_first(attrs, "FILENAME", "filename", default=""))
+            if fname.startswith(worktree_prefix):
+                fname = fname[len(worktree_prefix):]
+            methods[full_name] = _MethodInfo(
+                full_name=full_name,
+                name=short,
+                filename=fname,
+                start_line=int(_first(attrs, "LINE_NUMBER", "lineNumber", default=0) or 0),
+                end_line=int(_first(attrs, "LINE_NUMBER_END", "lineNumberEnd", default=0) or 0),
+            )
+            node_owner[str(nid)] = full_name
+        elif label == "CALL":
+            target = str(_first(attrs, "METHOD_FULL_NAME", "methodFullName", default=""))
+            if target and not target.startswith("<operator>"):
+                pending_calls.append((str(nid), target))
 
-        # Pass 1: collect METHOD nodes and start ownership map.
-        for v in vertices:
-            label = v.get("label")
-            props = _flat_props(v)
-            if label == "METHOD":
-                full_name = props.get("fullName") or props.get("name", "")
-                short = props.get("name", "")
-                if not full_name or full_name.startswith("<operator>"):
-                    continue  # skip Joern's synthetic operator methods
-                # Skip Joern's C frontend synthetic wrappers. `<global>` is a
-                # per-file container for file-scope declarations; `<includes>`
-                # holds preprocessor state. Both span the whole file and will
-                # swallow any modified line if we let them compete with real
-                # functions — filter them out unconditionally.
-                if short in ("<global>", "<includes>") or \
-                   full_name.endswith(":<global>") or \
-                   full_name.endswith(":<includes>"):
-                    continue
-                fname = props.get("filename", "")
-                # Normalize to repo-relative if we can.
-                if fname.startswith(worktree_prefix):
-                    fname = fname[len(worktree_prefix):]
-                methods[full_name] = _MethodInfo(
-                    full_name=full_name,
-                    name=props.get("name", ""),
-                    filename=fname,
-                    start_line=int(props.get("lineNumber") or 0),
-                    end_line=int(props.get("lineNumberEnd") or 0),
-                )
-                node_owner[_vid(v, "id")] = full_name
-            elif label == "CALL":
-                target = props.get("methodFullName", "")
-                if target and not target.startswith("<operator>"):
-                    pending_calls.append((_vid(v, "id"), target))
+    # Pass 2: propagate ownership via CONTAINS and AST edges (BFS from each METHOD).
+    from collections import defaultdict as _dd
+    adj: dict[str, list[str]] = _dd(list)
+    for u, v, k in G.edges(keys=True):
+        if k in ("CONTAINS", "AST"):
+            adj[str(u)].append(str(v))
 
-        # Pass 2: propagate ownership down CONTAINS and AST edges.
-        # METHOD --CONTAINS--> any descendant; if CONTAINS isn't present in
-        # this export, AST edges give the same closure with more hops.
-        adj: dict[str, list[str]] = {}
-        for e in edges:
-            if e.get("label") in ("CONTAINS", "AST"):
-                adj.setdefault(_vid(e, "outV"), []).append(_vid(e, "inV"))
+    for method_nid in list(node_owner.keys()):
+        owner = node_owner[method_nid]
+        stack = [method_nid]
+        while stack:
+            cur = stack.pop()
+            for child in adj.get(cur, ()):
+                if child not in node_owner:
+                    node_owner[child] = owner
+                    stack.append(child)
 
-        # BFS out from each METHOD to mark owned nodes.
-        for method_node_id, owner in list(node_owner.items()):
-            stack = [method_node_id]
-            while stack:
-                cur = stack.pop()
-                for child in adj.get(cur, ()):
-                    if child not in node_owner:
-                        node_owner[child] = owner
-                        stack.append(child)
-
-    # Resolve every pending CALL node -> caller method, and record the edge.
+    # Resolve pending CALLs.
     resolved = external = orphan = 0
     sample_unresolved: list[str] = []
-    for call_node_id, target_full_name in pending_calls:
-        caller = node_owner.get(call_node_id)
+    for call_nid, target in pending_calls:
+        caller = node_owner.get(call_nid)
         if caller is None:
             orphan += 1
-            continue  # orphan call node (Joern sometimes emits these)
-        if target_full_name not in methods:
-            # External or name-mismatched call. Keep a small sample for
-            # debugging — if a project-local function gets listed here it
-            # usually means Joern's METHOD.fullName vs CALL.methodFullName
-            # don't agree (happens with C++ overloads, static functions in
-            # some Joern versions). Log the sample so we can see the mismatch.
+            continue
+        if target not in methods:
             external += 1
             if len(sample_unresolved) < 5:
-                sample_unresolved.append(target_full_name)
+                sample_unresolved.append(target)
             continue
-        callees.setdefault(caller, set()).add(target_full_name)
-        callers.setdefault(target_full_name, set()).add(caller)
+        callees.setdefault(caller, set()).add(target)
+        callers.setdefault(target, set()).add(caller)
         resolved += 1
 
     log.info(
@@ -378,111 +383,6 @@ def load_methods_and_callgraph(
         log.info("  sample unresolved call targets: %s", sample_unresolved)
         log.info("  known methods (first 5): %s", list(methods.keys())[:5])
     return methods, callers, callees
-
-
-def _vertices(data: dict) -> list[dict]:
-    """GraphSON shape varies — support both common layouts."""
-    if "vertices" in data:
-        return data["vertices"]
-    return data.get("@value", {}).get("vertices", [])
-
-
-def _edges(data: dict) -> list[dict]:
-    if "edges" in data:
-        return data["edges"]
-    return data.get("@value", {}).get("edges", [])
-
-
-def _unwrap(v):
-    """GraphSON v3 wraps typed values as {"@type": "g:Int64", "@value": 42}.
-    Return the bare value (recursively for lists). Plain values pass through
-    unchanged so this is safe to call on any JSON subtree."""
-    if isinstance(v, dict) and "@value" in v and "@type" in v:
-        return _unwrap(v["@value"])
-    if isinstance(v, list):
-        return [_unwrap(x) for x in v]
-    return v
-
-
-def _vid(obj: dict, key: str) -> str:
-    """Read a vertex/edge id field and return it as a string, handling both
-    raw numeric ids (old GraphSON) and g:Int64-wrapped ids (v3)."""
-    return str(_unwrap(obj.get(key)))
-
-
-def _flat_props(vertex: dict) -> dict:
-    """Flatten GraphSON properties to name->value. Handles Joern 4.x GraphSON v3:
-
-        properties = {
-          "FULL_NAME": {
-            "@type": "g:VertexProperty",
-            "@value": {
-              "@type": "g:List",
-              "@value": ["copy_bytes"]      # or [{"@type": "g:Int32", "@value": 6}]
-            },
-            "id": {...}
-          },
-          ...
-        }
-
-    Also supports older formats where properties map to a flat list or to
-    {"id": ..., "value": X}.
-
-    Joern's v3 export uses SCREAMING_SNAKE keys (FULL_NAME, LINE_NUMBER,
-    FILENAME). The rest of this codebase was written assuming camelCase
-    (fullName, lineNumber, filename) because that's what Joern's internal
-    model and older exports use. We emit BOTH forms in the output dict so
-    downstream lookups work regardless of which export dialect produced the
-    file.
-    """
-    out: dict = {}
-    for k, raw in vertex.get("properties", {}).items():
-        val = _extract_property_value(raw)
-        if val is None:
-            continue
-        out[k] = val
-        # Alias SCREAMING_SNAKE (and all-caps single words) -> camelCase so
-        # code written against either works. Examples:
-        #   FULL_NAME  -> fullName
-        #   NAME       -> name
-        #   FILENAME   -> filename
-        if k.isupper():
-            if "_" in k:
-                parts = k.lower().split("_")
-                camel = parts[0] + "".join(p.capitalize() for p in parts[1:])
-            else:
-                camel = k.lower()
-            out.setdefault(camel, val)
-    return out
-
-
-def _extract_property_value(raw):
-    """Walk one GraphSON property value, unwrapping every layer we know about,
-    and return the underlying Python value. Returns None if the property is
-    empty. For properties that hold a list with more than one element we
-    return only the first — Joern doesn't use multi-valued properties for
-    the attributes we care about."""
-    v = raw
-    # Outer may be a list (old format: properties[k] = [{"id": ..., "value": Y}])
-    if isinstance(v, list):
-        if not v:
-            return None
-        v = v[0]
-    # VertexProperty wrapper (v3): {"@type": "g:VertexProperty", "@value": {...}}
-    if isinstance(v, dict) and v.get("@type") == "g:VertexProperty":
-        v = v.get("@value")
-    # Older flat {"id": ..., "value": Y} shape
-    if isinstance(v, dict) and "value" in v and "@type" not in v:
-        return _unwrap(v["value"])
-    # List wrapper (v3): {"@type": "g:List", "@value": [X]}
-    if isinstance(v, dict) and v.get("@type") == "g:List":
-        items = v.get("@value", [])
-        if not items:
-            return None
-        # Take the first element; unwrap it in case it's a typed primitive.
-        return _unwrap(items[0])
-    # Any remaining typed wrapper (g:Int32, g:String, etc.)
-    return _unwrap(v)
 
 
 # ---------------------------------------------------------------------------
