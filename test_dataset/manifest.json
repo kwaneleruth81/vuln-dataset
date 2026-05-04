@@ -1,0 +1,18 @@
+{
+  "run_config": {
+    "hops": 1,
+    "max_hops_slice": 10,
+    "proximity_lines": 3,
+    "debug_samples": true
+  },
+  "queue_path": "/Users/kwaneleruth/vulnerability-dataset/test_queue.jsonl",
+  "totals": {
+    "processed": 4,
+    "skipped": 0,
+    "samples": 8,
+    "nodes": 9701,
+    "positives": 2992
+  },
+  "elapsed_seconds": 235.1,
+  "generated_at": 1777887439.620974
+}
