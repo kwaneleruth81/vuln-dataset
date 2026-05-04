@@ -71,8 +71,7 @@ class Step1Result:
 # Sub-task A: parse the diff, extract modified lines per file per version
 # ---------------------------------------------------------------------------
 
-# A unified-diff hunk header looks like:
-#   @@ -old_start,old_count +new_start,new_count @@ optional_section_heading
+
 _HUNK_RE = re.compile(
     r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
     r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@"
@@ -124,7 +123,7 @@ def parse_modified_lines(
 
     for raw in diff_text.splitlines():
         # File header: "+++ b/path/to/file.c" is the post-patch path.
-        # We key on this; renames would need "--- a/..." tracking too, punt for v1.
+        # Key on this; renames would need "--- a/..." tracking too, punt for v1.
         if raw.startswith("+++ "):
             path = raw[4:].strip()
             if path == "/dev/null":

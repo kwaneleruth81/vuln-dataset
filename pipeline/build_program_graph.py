@@ -690,7 +690,7 @@ def build_program_graph(
     S = extract_statement_graph(raw, handle.worktree)
     augment_param_bindings(raw, S)
 
-    # Tag the graph with provenance so later steps can see what they're holding.
+    # Tagging the graph so later steps can see what they're holding.
     S.graph["commit"] = step1.commit
     S.graph["version"] = step1.version
     S.graph["patch_id"] = step1.patch_id

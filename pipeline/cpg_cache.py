@@ -58,7 +58,7 @@ class CPGHandle:
 
 
 def _cache_key(repo_path: Path, commit: str) -> str:
-    # Absolute path so moving the repo invalidates the cache, which is correct:
+    # Absolute path so moving the repo invalidates the cache, 
     # a different checkout location may have different relative-path semantics.
     raw = f"{repo_path.resolve()}::{commit}"
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
@@ -112,14 +112,9 @@ def get_or_build_cpg(
         shutil.rmtree(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Materialize source at this commit via git worktree.
-    #    Worktree is lighter than a full clone and doesn't touch the user's HEAD.
+
     if not worktree.exists():
         log.info("creating worktree for %s @ %s", repo_path.name, commit[:8])
-        # Prune stale worktree registry entries first. Without this, if a
-        # previous cache run's worktree dir was deleted (or we wiped the
-        # CPG cache), git still remembers it was registered and refuses to
-        # add a new one at the same path. `prune` is a safe idempotent op.
         subprocess.run(
             ["git", "worktree", "prune"],
             cwd=repo_path, capture_output=True,

@@ -124,7 +124,7 @@ class SinkReport:
     inclusion in the per-patch metadata down the line."""
     total_sinks: int = 0
     by_reason: dict[str, int] = field(default_factory=dict)
-    # APIs that were matched (good for sanity: did we actually see memcpy?)
+    # APIs that were matched (good for sanity checks)
     apis_hit: dict[str, int] = field(default_factory=dict)
     # If empty and cwes was non-empty, the CWE->API set didn't match any call
     # in this patch's candidate functions — worth noting.

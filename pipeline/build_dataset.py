@@ -19,7 +19,7 @@ import argparse, json, math, hashlib
 from collections import defaultdict, deque
 from pathlib import Path
 
-import networkx as nx  # pip install networkx
+import networkx as nx  
 
 
 # --- 1. Joern node label -> normalized stmt_type ------------------------------
@@ -43,7 +43,7 @@ CONTROL_STRUCT_MAP = {
     "CONTINUE": "CONTINUE", "GOTO": "GOTO",
 }
 
-# Operators Joern emits as CALL with special names — classify them.
+# Operators Joern emits as CALL with special names
 OPERATOR_TO_STMT = {
     "<operator>.assignment": "ASSIGN",
     "<operator>.addition": "ARITH",

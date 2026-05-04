@@ -20,7 +20,7 @@ The central goal is to support models that reason beyond a single changed line.
 The pipeline captures multi-function dependencies through control-flow,
 data-flow, call, and parameter-binding edges.
 
-## 2. Problem Statement
+## 2. Problem 
 
 Traditional vulnerability datasets often label entire files or functions. This
 is too coarse for models that need to learn which statements actually contribute
@@ -62,24 +62,10 @@ other models that consume structured program graphs.
 The project uses Joern to build Code Property Graphs (CPGs), NetworkX to process
 graphs in Python, and JSONL files as the final dataset format.
 
-```mermaid
-flowchart TD
-    A[Work queue JSONL] --> B[Repo cache]
-    B --> C[Vulnerable commit]
-    B --> D[Fixed commit]
-    C --> E[Joern CPG cache]
-    D --> E
-    E --> F[Candidate function discovery]
-    F --> G[Statement-level graph]
-    G --> H[Sink identification]
-    H --> I[Slice computation]
-    I --> J[Node annotation]
-    J --> K[nodes.jsonl]
-    J --> L[functions.jsonl]
-    J --> M[edges.jsonl]
-    J --> N[sinks.jsonl]
-    J --> O[manifest.json]
-```
+## Flowchart
+
+![alt text](image.png)
+
 
 ## 5. Input Format
 
@@ -137,13 +123,7 @@ candidate_functions = patch_functions union callers(patch_functions) union calle
 
 By default, the expansion is one hop.
 
-```mermaid
-flowchart LR
-    P[Patched function] --> C1[Callee]
-    P --> C2[Callee]
-    R1[Caller] --> P
-    R2[Caller] --> P
-```
+![alt text](image-1.png)
 
 Each candidate function is assigned a role:
 
@@ -180,15 +160,7 @@ For each commit, it:
 The current implementation uses `neo4jcsv` because it is more reliable on large
 real-world C projects than GraphSON or GraphML.
 
-```mermaid
-flowchart TD
-    A[Repository clone] --> B[Git worktree at commit]
-    B --> C[joern-parse]
-    C --> D[cpg.bin]
-    D --> E[joern-export --format neo4jcsv]
-    E --> F[CSV node and edge files]
-    F --> G[NetworkX MultiDiGraph]
-```
+![alt text](image-2.png)
 
 ## 9. Step 2: Statement-Level Graph Construction
 
@@ -246,14 +218,7 @@ The statement-level graph keeps semantic edges that are useful for ML training.
 AST edges are used internally during graph construction but are not part of the
 final traversal edge set used for slicing.
 
-```mermaid
-flowchart LR
-    A[Patch statement] -- CFG --> B[Branch]
-    A -- DFG --> C[Size variable use]
-    C -- CALL --> D[Callee METHOD_ENTRY]
-    C -- PARAM_BIND arg1 --> D
-    D -- CFG --> E[Sink call]
-```
+![alt text](image-3.png)
 
 ## 10. Step 3: Sink Identification
 
@@ -301,14 +266,7 @@ CFG union DFG union CALL union PARAM_BIND
 AST is intentionally excluded because AST structure does not by itself imply
 control, data, or interprocedural dependence.
 
-```mermaid
-flowchart TD
-    P[Patch nodes] -->|forward reachability| F[Forward reachable nodes]
-    S[Sink nodes] -->|reverse reachability| B[Backward reachable nodes]
-    F --> I[Intersection]
-    B --> I
-    I --> L[Labeled vulnerability slice]
-```
+![alt text](image-4.png)
 
 ### Slice Definition
 
@@ -401,17 +359,9 @@ The dataset covers five CVEs across vulnerable and fixed versions:
 | tcpdump | CVE-2018-14468 | vulnerable + fixed |
 | libpcap | CVE-2019-15161 | vulnerable + fixed |
 
-### Validation Output and Where to Insert It
+### Validation 
 
-The validation output belongs immediately after the "Current Dataset Output"
-section in reports, papers, or README-style documentation. It proves that the
-generated files are present, structurally complete, and internally consistent.
-
-Command:
-
-```bash
-python3 validate_dataset.py --out test_dataset
-```
+![alt text](image-5.png)
 
 The validation output contains:
 
@@ -481,20 +431,6 @@ It provides:
 | Streaming output | JSONL files are appended incrementally, keeping memory bounded. |
 | Manifest | Records totals, runtime, queue path, and run configuration. |
 
-Example command:
-
-```bash
-python3 build_dataset.py \
-  --work-queue test_queue.jsonl \
-  --out test_dataset \
-  --debug-samples
-```
-
-Validation command:
-
-```bash
-python3 validate_dataset.py --out test_dataset
-```
 
 ## 16. Testing
 
@@ -523,19 +459,15 @@ The test suite covers the most important behavior:
 
 ## 17. Bugs Found and Fixed
 
-During development, several real-world issues were found and hardened against.
+During development, several issues were found and hardened against.
 
 | Issue | Impact | Fix |
 | --- | --- | --- |
 | GraphSON nested property format | Initial reader expected simpler GraphSON values. | Moved final pipeline to `neo4jcsv`; earlier parsing lessons informed loader robustness. |
 | Joern synthetic `<global>` methods | File-wide fake functions could win line-containment lookups. | Filtered synthetic global/include methods. |
-| Bug-introducing commit vs fix parent confusion | Diff could include years of unrelated history. | Use vulnerable state adjacent to fix commit when constructing queue entries. |
-| Non-UTF-8 diff bytes | `git diff` decoding could fail. | Use `errors="replace"`. |
-| Hunk context spilling into adjacent functions | Pure-addition fixes could attribute context to the wrong function. | Keep only context lines within a small window of actual additions. |
 | Method map unpacking bug | BFS could start from a function-name string instead of node ID. | Corrected key/value handling. |
 | GraphSON export crash | Joern failed on large real CPGs. | Switched to `neo4jcsv`. |
 | GraphML JVM entity-size limit | Large XML export crashed during Joern's internal formatting. | Avoided GraphML and used `neo4jcsv`. |
-| Stale git worktree registry | Removing CPG cache left dangling worktree metadata. | Run `git worktree prune` before creating new worktrees. |
 | PARAM_BIND deduplication | Multiple call arguments collapsed into one edge. | Include argument index in `PARAM_BIND` edge key. |
 
 ## 18. Current State
@@ -554,13 +486,13 @@ The project currently has:
 This is a working prototype dataset generator. It has been tested on real CVEs
 and produces structurally valid output.
 
-## 19. What's Left
+## 19. Next steps
 
-Two things remain, in order of recommendation.
+Two things remain;
 
 ### 1. CVEfixes Ingestor
 
-Build a small ingestor that turns the CVEfixes SQLite dump into a work queue.
+Build a small ingestor that turns the CVEfixes SQLite (from Zenodo) dump into a work queue.
 
 The output should be a JSONL file with the same schema as `test_queue.jsonl`:
 
@@ -578,20 +510,10 @@ The output should be a JSONL file with the same schema as `test_queue.jsonl`:
 After this exists, the project can scale from five CVEs to hundreds or
 thousands by changing only the work queue file.
 
-Expected command shape:
-
-```bash
-python3 ingest_cvefixes.py \
-  --db CVEfixes.db \
-  --out queue_500.jsonl \
-  --limit 500
-```
-
-Estimated size: about 80 lines of code.
 
 ### 2. Full-Scale Run
 
-Once the ingestor produces a 500-CVE queue, run the orchestrator overnight.
+Once the ingestor produces a 500-CVE queue, the next step is to run the orchestrator
 
 Expected command shape:
 
