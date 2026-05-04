@@ -6,7 +6,7 @@ This project builds a node-level vulnerability dataset for training machine
 learning models to identify which program statements contribute to a
 vulnerability.
 
-The dataset is built from real CVE-fixing commits. For each vulnerability, the
+The dataset, labelled test_dataset from the files is built from real CVE-fixing commits.For each vulnerability, the
 pipeline analyzes both:
 
 - the vulnerable version of the code
