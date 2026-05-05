@@ -25,7 +25,8 @@
 10. [Validation](#10-validation)
 11. [Empirical Results](#11-empirical-results)
 12. [Known Bugs Fixed During Development](#12-known-bugs-fixed-during-development)
-13. [Future Work](#13-future-work)
+13. [Dataset Information](#13-dataset-information)
+14. [Future Work](#14-future-work)
 
 ---
 
@@ -880,7 +881,7 @@ anyone extending the pipeline or porting it to a new Joern version.
 ---
 ---
 
-## Dataset
+## 13. Dataset Information
 
 The dataset lives in the `test_dataset/` folder in this repository. It is not a
 single file — it is six files that together form the complete dataset.
@@ -1013,7 +1014,7 @@ vary across machines but does not affect the canonical node IDs in the output).
 
 ---
 
-## 13. Future Work
+## 14. Future Work
 
 ### A. CVEfixes Ingestor (immediate next step)
 
