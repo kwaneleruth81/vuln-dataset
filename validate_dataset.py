@@ -123,33 +123,50 @@ def main() -> int:
     else:
         red_flags.append("could not identify any (patch, version) samples from node ids")
 
-    # 6. Referential integrity on a sample of edges.
-    if node_by_id:
-        bad = 0
-        checked = 0
-        for e in _iter_jsonl(d / "edges.jsonl"):
-            checked += 1
-            if checked > 5000:
-                break
-            if e.get("src") not in node_by_id or e.get("dst") not in node_by_id:
-                # Only count as bad when BOTH endpoints should be in our sample.
-                # If the edge's patch/version is outside the first 2k nodes we
-                # cached, it's expected to miss — skip silently.
-                # Be conservative: only flag when patch_id is known in nodes.
-                pass
-        # Stronger check: ensure at least some edges resolve.
-        resolved = 0
-        seen = 0
-        for e in _iter_jsonl(d / "edges.jsonl"):
-            seen += 1
-            if seen > 5000:
-                break
-            if e.get("src") in node_by_id and e.get("dst") in node_by_id:
-                resolved += 1
-        if seen and resolved == 0:
-            red_flags.append("no edges resolve to cached node ids (integrity check failed)")
-        elif seen:
-            print(f"\nEdge integrity (sample): {resolved}/{seen} edges resolve to known node ids")
+   # 6. Full referential integrity: load all node IDs and walk every edge.
+    print("\nChecking full edge integrity (this may take a moment)...")
+    all_node_ids: set[str] = set()
+    for rec in _iter_jsonl(d / "nodes.jsonl"):
+        nid = rec.get("id")
+        if nid:
+            all_node_ids.add(nid)
+
+    total_edges = 0
+    unresolved = 0
+    cross_sample = 0
+    for e in _iter_jsonl(d / "edges.jsonl"):
+        total_edges += 1
+        src = e.get("src")
+        dst = e.get("dst")
+        src_in = src in all_node_ids
+        dst_in = dst in all_node_ids
+        if not (src_in and dst_in):
+            unresolved += 1
+            continue
+        # Both resolve. Check they're in the same sample.
+        # Canonical ID format: "<patch_id>:<version>:<index>".
+        # Same-sample iff the prefix before the final ':' matches.
+        if src.rsplit(":", 1)[0] != dst.rsplit(":", 1)[0]:
+            cross_sample += 1
+
+    if total_edges:
+        unres_pct = 100.0 * unresolved / total_edges
+        print(f"\nEdge integrity (full):")
+        print(f"  total edges:   {total_edges:,}")
+        print(f"  unresolved:    {unresolved:,} ({unres_pct:.2f}%)")
+        print(f"  cross-sample:  {cross_sample:,} (should be 0)")
+        if unresolved > 0:
+            red_flags.append(
+                f"{unresolved} edges have endpoints not in nodes.jsonl "
+                f"({unres_pct:.2f}%)"
+            )
+        if cross_sample > 0:
+            red_flags.append(
+                f"{cross_sample} edges connect nodes from different samples "
+                f"(canonical IDs leaking across samples)"
+            )
+    else:
+        print("\nNo edges to check.")
 
     # 7. Sinks sanity.
     sink_count = counts["sinks.jsonl"]
