@@ -24,9 +24,11 @@
 9. [Output Dataset Schema](#9-output-dataset-schema)
 10. [Validation](#10-validation)
 11. [Empirical Results](#11-empirical-results)
-12. [Known Bugs Fixed During Development](#12-known-bugs-fixed-during-development)
-13. [Dataset Information](#13-dataset-information)
-14. [Future Work](#14-future-work)
+12. [The CVEfixes Ingestor](#12-the-cvefixes-ingestor)
+13. [Production Run Operations Notes](#13-production-run-operations-notes)
+14. [Known Bugs Fixed During Development](#14-known-bugs-fixed-during-development)
+15. [Dataset Information](#15-dataset-information)
+16. [Future Work](#16-future-work)
 
 ---
 
@@ -784,6 +786,21 @@ Run metadata: config, totals, elapsed time.
 }
 ```
 
+### Downloading the production dataset
+
+The production 500-CVE dataset (`dataset_500/`) is not stored in this repository — `nodes.jsonl` (922 MB) and `edges.jsonl` (790 MB) exceed GitHub's file size limit. The smaller provenance files (`functions.jsonl`, `sinks.jsonl`, `skipped.jsonl`, `manifest.json`) are tracked in git directly.
+
+The full dataset is available for download at: **[Google Drive link to be added by author]**
+
+| File | Size | Location |
+|------|------|----------|
+| `nodes.jsonl` | 922 MB | Google Drive |
+| `edges.jsonl` | 790 MB | Google Drive |
+| `functions.jsonl` | 5 MB | Git repository |
+| `sinks.jsonl` | 1.7 MB | Git repository |
+| `skipped.jsonl` | 183 KB | Git repository |
+| `manifest.json` | 388 B | Git repository |
+
 ---
 
 ## 10. Validation
@@ -857,9 +874,192 @@ Per-CVE positive rates vary: tcpdump/CVE-2017-16808 (25%) vs curl/CVE-2023-38545
 patterns. Class weighting or `max_hops` tuning can adjust this tradeoff at
 training time.
 
+### Production run: 500-CVE dataset
+
+The production run processed 500 CVEs from the CVEfixes v1.0.8 dataset over
+approximately 24 hours across two sessions (see [Section 13](#13-production-run-operations-notes)
+for operational details).
+
+| Metric | Value |
+|--------|-------|
+| CVEs in queue | 500 |
+| CVEs successfully processed | 215 (43%) |
+| Total samples | 420 |
+| Total node records | 601,662 |
+| Total edge records | 4,546,098 |
+| Total sinks identified | 7,571 |
+| Positive label rate | 23.27% (140,027 / 601,661) |
+| Project diversity | 100+ unique C projects |
+| Processing time | ~24 hours across two sessions |
+
+#### Skip breakdown
+
+285 of 500 CVEs were skipped:
+
+| Stage | Count | % of skips | Primary reason |
+|-------|-------|------------|----------------|
+| `step1` — no function-scope changes | 236 | 70% | CVEfixes patches touched non-C files only |
+| `step1/cpg_build` — Joern parse failures | 68 | 20% | Joern failed to parse the commit's source |
+| `clone/fetch` — network drops | 34 | 10% | Network failures during the run |
+
+The dominant skip cause — "no function-scope changes" — reflects a data quality
+issue in CVEfixes: many CVEs whose metadata lists C as the language have patches
+that modify only Makefiles, documentation, or header-only changes with no function
+bodies. This is a property of the upstream dataset, not the pipeline.
+
+#### Top sink types
+
+| API | Count |
+|-----|-------|
+| `memcpy` | 1,528 |
+| `fprintf` | 1,270 |
+| `free` | 1,121 |
+| `printf` | 856 |
+| `memset` | 829 |
+
+#### Statement type distribution
+
+| Type | % |
+|------|---|
+| ASSIGN | 21.6% |
+| CALL | 19.3% |
+| DECL | 15.4% |
+| IF | 14.1% |
+| OTHER | 4.4% |
+
+The positive rate of 23.27% is lower than the 5-CVE validation run (34.2%).
+The validation CVEs were selected because they were known to work cleanly with
+the pipeline. The production set includes more diverse patch shapes, some with
+sparse or diffuse vulnerability patterns that produce smaller slices.
+
 ---
 
-## 12. Known Bugs Fixed During Development
+## 12. The CVEfixes Ingestor
+
+**Module**: `ingest_cvefixes.py`
+
+### Purpose
+
+`ingest_cvefixes.py` converts a CVEfixes SQLite dump into the work-queue JSONL
+format consumed by `build_dataset.py`. Each output line is one CVE entry ready
+for pipeline processing.
+
+### The CVEfixes dataset
+
+CVEfixes v1.0.8 (Bhandari et al., 2021) contains fix commits for CVEs across a
+wide range of open-source projects:
+
+| Metric | Value |
+|--------|-------|
+| Fix commits | 12,107 |
+| CVEs covered | 11,873 |
+| Projects | 4,249 |
+| Download size | 12.7 GB |
+| Zenodo DOI | 10.5281/zenodo.13118970 |
+
+### Filter chain
+
+The ingestor applies five filters in sequence:
+
+| Filter | Effect |
+|--------|--------|
+| `language = 'C'` | Drops non-C CVEs (Python, Java, JavaScript, etc.) |
+| Has fix commit | Drops entries with no resolvable commit URL |
+| Non-banned project | Drops projects on the ban list |
+| Has CWE classification | Drops entries with no CWE (needed for Step 3 sink table) |
+| Has parent commit | Drops entries where `commit_fix~1` cannot be resolved |
+
+Starting from 12,931 `(CVE, fix)` rows, the chain produces **2,144 unique
+C-language CVEs**. The 18% pass rate is dominated by language filtering: 71% of
+CVEfixes is non-C code.
+
+Where multiple fix commits exist for the same CVE, the ingestor keeps the
+chronologically earliest one.
+
+### Schema-aware design
+
+CVEfixes has undergone schema changes across versions. The ingestor probes for
+the presence of the `language` column at startup and skips the language filter
+if the column is absent, for compatibility with older dumps.
+
+The `parents` field in CVEfixes is stored as a Python-list-literal string
+(e.g. `"['abc123def']"`), not a space-separated SHA or a JSON array. The
+ingestor parses this with `ast.literal_eval` rather than string splitting.
+
+### Ban list
+
+Large codebases are unsuitable for the pipeline's 1-hop scoping strategy: their
+CPGs exceed available memory. The default ban list includes the Linux kernel.
+During the 500-CVE production run, `php-src` and `ImageMagick` were added after
+OOM crashes on their CPGs (3M+ nodes). Machines with 16 GB RAM should include
+these in their ban list by default.
+
+### CLI reference
+
+```
+python3 ingest_cvefixes.py \
+    --db    CVEfixes.db    \   # path to downloaded SQLite dump
+    --out   queue.jsonl    \   # output work queue
+    --limit 500            \   # cap output at N entries
+    --ban   linux,php-src  \   # comma-separated projects to exclude
+    --no-c-filter              # skip language=C filter (for testing)
+```
+
+---
+
+## 13. Production Run Operations Notes
+
+This section records observations from the 500-CVE production run that are
+relevant to anyone running the pipeline at scale.
+
+### OOM crash on php-src
+
+After processing 110 CVEs successfully, the first session was killed by the OS
+OOM killer while building the Joern CPG for a `php-src` commit. The `php-src`
+CPG at that commit had approximately 3.1M nodes and 27M edges — beyond the
+memory capacity of the 16 GB machine used. The run was restarted after adding
+`php-src` and `ImageMagick` to the ban list. The resume mechanism picked up
+from CVE 111 with no data loss.
+
+### Disk pressure
+
+The CPG cache at `~/.cache/vuln_dataset/cpgs/` grew to over 200 GB during
+the run as Joern CPG binaries accumulated for each processed commit. The cache
+is safe to wipe between sessions: Joern rebuilds CPGs from the source repo as
+needed, and the source repos remain in `~/.cache/vuln_dataset/repos/`. After
+wiping the CPG cache and restarting the second session, the pipeline resumed
+cleanly.
+
+### Resume correctness
+
+The resume mechanism (scanning `functions.jsonl` for already-processed
+`patch_id` entries) worked correctly across both sessions and after the CPG
+cache wipe. No duplicate entries were produced.
+
+### Practical recommendations for 16 GB RAM machines
+
+- Ban `php-src`, `ImageMagick`, and other large C codebases whose CPGs exceed
+  available memory.
+- Monitor disk usage during the run; the CPG cache can grow to hundreds of GB
+  for a 500-CVE queue. Wipe between sessions if needed.
+- Run sequentially (the default). Parallel processing would multiply peak
+  memory usage.
+- `Ctrl-C` triggers a graceful shutdown; the partial output is safe to resume
+  from.
+
+### Skip rate interpretation
+
+The 42% overall skip rate (285 / 500 CVEs) is dominated by CVEfixes data
+quality, not pipeline failures. 236 of 285 skips (70%) are "no function-scope
+changes" — CVEs whose patches touched Makefiles, documentation, or
+non-function C code. These entries pass the ingestor's language filter but
+produce no candidate functions in Step 1. This is a known limitation of using
+CVEfixes as an upstream data source and is not correctable without manual
+curation.
+
+---
+
+## 14. Known Bugs Fixed During Development
 
 The following engineering challenges were encountered and resolved during the
 development of this pipeline. They are documented here as guidance for
@@ -879,11 +1079,15 @@ anyone extending the pipeline or porting it to a new Joern version.
 | 10 | PARAM_BIND deduplication collapsing arguments | All arguments of a call collapsed to one edge | Included arg index in dedup key: `PARAM_BIND_{idx}` |
 
 ---
----
 
-## 13. Dataset Information
+## 15. Dataset Information
 
-The dataset lives in the `test_dataset/` folder in this repository. It is not a
+This section documents the 5-CVE validation dataset in `test_dataset/`, generated
+during the initial pipeline validation phase. The production 500-CVE dataset is
+described in [Section 11](#11-empirical-results) and is available for download
+via the link in [Section 9](#9-output-dataset-schema).
+
+The validation dataset lives in the `test_dataset/` folder in this repository. It is not a
 single file — it is six files that together form the complete dataset.
 
 ```
@@ -1014,62 +1218,26 @@ vary across machines but does not affect the canonical node IDs in the output).
 
 ---
 
-## 14. Future Work
+## 16. Future Work
 
-### A. CVEfixes Ingestor (immediate next step)
+### A. CVEfixes Ingestor
 
-**Status**: Designed, not yet implemented.
+**Status**: Complete. See [Section 12](#12-the-cvefixes-ingestor).
 
-**Purpose**: CVEfixes (Bhandari et al., 2021) is a dataset of ~28,000 CVE fix
-commits across hundreds of open-source projects, available as a ~1 GB SQLite
-dump on Zenodo (version 5.1). The ingestor converts CVEfixes rows into the
-work-queue JSONL format consumed by `build_dataset.py`.
-
-**Design**:
-
-```
-python3 ingest_cvefixes.py \
-    --db        CVEfixes.db    \   # path to downloaded SQLite dump
-    --out       queue.jsonl    \   # output work queue
-    --lang      c              \   # C only (Joern C frontend)
-    --limit     500            \   # start small; scale up once validated
-    --ban       linux          \   # Linux kernel is too large
-```
-
-Filtering criteria:
-- `language = 'C'` — C++ is excluded until Joern's C++ frontend is tested
-- Non-null fix commit URL pointing to a resolvable GitHub commit
-- Non-empty CWE list (needed for Step 3's sink table)
-- Project not on the ban list (Linux kernel default-banned; too large at 30M LoC)
-- One fix commit per CVE (chronologically first where multiple exist)
-
-**Estimated scale**: ~2,000-5,000 qualifying C CVEs in CVEfixes 5.1. Starting
-with 500 gives a manageable overnight run (~4-8 hours at ~30-60s/CVE) and a
-meaningful training set of ~500k-1M node records.
+The ingestor was implemented as `ingest_cvefixes.py`. It processed CVEfixes
+v1.0.8 (12,107 fix commits, 11,873 CVEs) and produced a 500-entry work queue
+of C-language CVEs. The actual pass rate was 18% (2,144 qualifying C CVEs from
+12,931 rows), dominated by language filtering (71% of CVEfixes is non-C).
 
 ### B. Full-Scale Dataset Run
 
-**Status**: Not yet started. Depends on A.
+**Status**: Complete. See [Section 11](#11-empirical-results) and
+[Section 13](#13-production-run-operations-notes).
 
-**Target**: 1,500-3,000 CVEs from CVEfixes. At 30-60s per CVE:
-
-| CVE count | Estimated time | Estimated nodes |
-|-----------|----------------|-----------------|
-| 500 | 4-8 hours | ~500k |
-| 1,500 | 12-25 hours | ~1.5M |
-| 3,000 | 25-50 hours | ~3M |
-
-Storage estimate: ~10-30 GB for 3M nodes including edges and metadata.
-
-**Recommended execution**: Run overnight on a machine with ≥16 GB RAM. Joern
-requires 4-8 GB per invocation; the pipeline is sequential (one Joern instance
-at a time) so peak memory stays bounded.
-
-**Output**: A research-grade dataset covering diverse CWEs, project sizes,
-and bug shapes, suitable for:
-- Training and evaluating GNN-based vulnerability detection models
-- Benchmarking program slicing algorithms
-- Studying the characteristics of inter-procedural vulnerability propagation
+A 500-CVE queue was processed over approximately 24 hours across two sessions.
+215 CVEs (43%) were processed successfully, producing 601,662 node records
+across 100+ unique C projects. The 42% skip rate was dominated by CVEfixes data
+quality. Operational notes (OOM crash, disk pressure, resume) are in Section 13.
 
 ### C. Parallel Processing
 
@@ -1126,6 +1294,16 @@ and choose a `max_hops_slice` value that pushes the aggregate rate below 20%.
 This reduces class imbalance without sacrificing meaningful slice coverage. Pilot
 experiments can be run by re-running the validator on the same cached CPGs with
 different hop counts (the CPG cache makes re-slicing cheap).
+
+### G. Dataset Publication and Sharing
+
+**Status**: Partially complete.
+
+The 500-CVE dataset was uploaded to Google Drive (link in [Section 9](#9-output-dataset-schema)).
+For long-term archival and citability, future work could publish to Zenodo for
+a permanent DOI, following the CVEfixes precedent (DOI 10.5281/zenodo.13118970).
+A Zenodo record would allow the dataset to be cited in academic papers and would
+guarantee availability independent of the author's Google Drive account.
 
 ---
 

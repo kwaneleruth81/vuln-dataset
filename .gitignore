@@ -1,0 +1,6 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+dataset_500/
+smoke_dataset/
