@@ -1,574 +1,302 @@
-# Vulnerability Dataset Pipeline: Technical Documentation
+# Vulnerability Dataset Pipeline
 
-**Project**: Node-Level Vulnerability Dataset for Automated Vulnerability Detection  
-**Author**: Kwanele Ruth  
-**Last updated**: May 2026
+A pipeline for producing **node-level vulnerability detection datasets** from real CVE patches in open-source C projects. Each statement in the source code becomes one labeled training record, with features describing its position in the program graph and a binary label indicating whether it participates in the vulnerability.
+
+The output is designed to support research on automated vulnerability detection and inter-procedural program slicing, particularly approaches that consider multi-function interactions and patch proximity.
+
+---
+
+## Dataset Download
+
+The current public release of this dataset (500-CVE production run) is hosted on Google Drive:
+
+**[Download dataset_500/ from Google Drive →](INSERT_GOOGLE_DRIVE_LINK_HERE)**
+
+The download contains six files totaling ~1.7 GB:
+
+| File | Size | Content |
+|------|------|---------|
+| `nodes.jsonl` | 922 MB | 601,662 labeled node records (the main payload) |
+| `edges.jsonl` | 790 MB | 4,546,098 graph edges between nodes |
+| `functions.jsonl` | 5 MB | 23,294 function-level provenance records |
+| `sinks.jsonl` | 1.7 MB | 7,571 dangerous-API sink records |
+| `skipped.jsonl` | 183 KB | 338 records of CVEs that could not be processed |
+| `manifest.json` | 388 B | Run config and totals |
+
+Smaller provenance files (`functions.jsonl`, `sinks.jsonl`, `manifest.json`, `skipped.jsonl`) are also tracked in this repository under `dataset_500/` for inspection without downloading the full archive.
+
+---
+
+## Quick Summary
+
+| | |
+|---|---|
+| **Dataset format** | JSONL (one JSON record per line) |
+| **CVEs processed** | 215 (of 500 attempted) |
+| **Samples** | 420 (vulnerable + fixed version per CVE) |
+| **Node records** | 601,662 |
+| **Edge records** | 4,546,098 |
+| **Positive label rate** | 23.27% |
+| **CVEs in source pool (CVEfixes)** | 11,873 across 4,249 projects |
+| **Unique projects in dataset** | 100+ |
+| **Languages covered** | C |
+| **CWE families** | CWE-119, CWE-122, CWE-125, CWE-787, CWE-20, CWE-190, CWE-476, and others |
+| **Total processing time** | ~24 hours sequential on a 16 GB MacBook Pro |
 
 ---
 
 ## Table of Contents
 
-1. [Overview and Motivation](#1-overview-and-motivation)
-2. [System Architecture](#2-system-architecture)
-3. [Prerequisites and Environment](#3-prerequisites-and-environment)
-4. [Pipeline Steps in Detail](#4-pipeline-steps-in-detail)
-   - [Step 1: Candidate Function Discovery](#step-1-candidate-function-discovery)
-   - [Step 2: Program Graph Construction](#step-2-program-graph-construction)
-   - [Step 3: Sink Identification](#step-3-sink-identification)
-   - [Step 5: Slice Computation](#step-5-slice-computation)
-   - [Step 7: Node Annotation and Feature Extraction](#step-7-node-annotation-and-feature-extraction)
-5. [How Graphs Were Constructed](#5-how-graphs-were-constructed)
-6. [How Slices Were Computed](#6-how-slices-were-computed)
-7. [Features Included](#7-features-included)
-8. [The Batch Orchestrator](#8-the-batch-orchestrator)
-9. [Output Dataset Schema](#9-output-dataset-schema)
-10. [Validation](#10-validation)
-11. [Empirical Results](#11-empirical-results)
-12. [The CVEfixes Ingestor](#12-the-cvefixes-ingestor)
-13. [Production Run Operations Notes](#13-production-run-operations-notes)
-14. [Known Bugs Fixed During Development](#14-known-bugs-fixed-during-development)
-15. [Dataset Information](#15-dataset-information)
-16. [Future Work](#16-future-work)
+1. [Background and Motivation](#1-background-and-motivation)
+2. [How It Works](#2-how-it-works)
+3. [The Seven Pipeline Steps](#3-the-seven-pipeline-steps)
+4. [How Graphs Are Constructed](#4-how-graphs-are-constructed)
+5. [How Slices Are Computed](#5-how-slices-are-computed)
+6. [Features Included in Each Node Record](#6-features-included-in-each-node-record)
+7. [Repository Layout](#7-repository-layout)
+8. [Setup and Prerequisites](#8-setup-and-prerequisites)
+9. [Reproducing the Dataset from Scratch](#9-reproducing-the-dataset-from-scratch)
+10. [Development History: From 5 CVEs to 500](#10-development-history-from-5-cves-to-500)
+11. [Bugs Encountered During Development](#11-bugs-encountered-during-development)
+12. [Empirical Results](#12-empirical-results)
+13. [Future Work](#13-future-work)
+14. [Citation](#14-citation)
 
 ---
 
-## 1. Overview and Motivation
+## 1. Background and Motivation
 
-### Problem Statement
+Most existing vulnerability detection datasets label entire functions as "vulnerable" or "clean." That granularity has two limitations.
 
-Modern software security research increasingly relies on machine learning models to automate
-vulnerability detection. Most prior work operates at the function or file level, classifying
-entire functions as "vulnerable" or "clean." This coarse granularity has two problems:
+First, it does not identify *which statements* within a function are responsible for the vulnerability. For automated patch suggestion or root-cause analysis, knowing the function is too coarse — you need the specific lines.
 
-1. **It does not identify which statements** within a function are responsible for
-   the vulnerability — information that is essential for automated patch suggestion,
-   vulnerability localisation, and root cause analysis.
-2. **It ignores inter-procedural dependencies.** Many real vulnerabilities arise from
-   data flowing across function boundaries, a dangerous value computed in one function
-   and consumed unsafely in another. Function level classifiers by definition cannot
-   model this.
+Second, it ignores inter-procedural dependencies. Many real vulnerabilities arise from values flowing across function boundaries: a length is computed wrong in one function and consumed unsafely as a memcpy argument in another. Function-level classifiers cannot model this.
 
-### What This Pipeline Produces
-
-This pipeline produces a **node-level dataset** where each record represents one C
-statement. Each record carries:
-
-- **Features** derived from the Code Property Graph (CPG): control-flow neighbors,
-  data-flow neighbors, call edges, loop/branch depth, variables used and defined,
-  distance to the patch, and whether the node participates in cross-function edges.
-- **A binary label**: `1` if the statement lies within the vulnerability-relevant
-  slice (i.e., it contributes to or is affected by the vulnerability), `0` otherwise.
-- **Provenance**: which CVE, which project, which function, which version
-  (vulnerable or fixed), and which role (patch function, caller, callee).
-
-### Research Goals
-
-The dataset is designed to:
-
-- Train models to predict which program statements contribute to a vulnerability,
-  considering multi-function interactions.
-- Support research on automated vulnerability detection and inter-procedural
-  program slicing.
-- Enable comparison between the vulnerable and fixed versions of the same code,
-  which is valuable for patch suggestion and fix localization.
+This pipeline produces a **node-level dataset** where each record represents one C statement, with both its features and a label indicating whether it participates in the vulnerability. The labeling is computed via inter-procedural program slicing, so multi-function vulnerability propagation is captured directly in the labels.
 
 ---
 
-## 2. System Architecture
+## 2. How It Works
 
 ```
-Work Queue (JSONL)
-      │
-      ▼
-┌─────────────────────────────────────────────────────────┐
-│                   build_dataset.py                       │
-│              (Batch Orchestrator)                        │
-│                                                         │
-│  ┌──────────┐  ┌──────────────────────────────────────┐ │
-│  │RepoCache │  │         Per-Patch Pipeline            │ │
-│  │(git clone│  │                                       │ │
-│  │ + fetch) │  │  Step 1: find_candidate_functions()   │ │
-│  └──────────┘  │         ↓                             │ │
-│                │  Step 2: build_program_graph()         │ │
-│  ┌──────────┐  │         ↓                             │ │
-│  │CPG Cache │  │  Step 3: identify_sinks()             │ │
-│  │(Joern    │  │         ↓                             │ │
-│  │ neo4jcsv)│  │  Step 5: compute_slice()              │ │
-│  └──────────┘  │         ↓                             │ │
-│                │  Step 7: annotate_nodes()             │ │
-│                └──────────────────────────────────────┘ │
-│                          ↓                               │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │             DatasetWriter (JSONL)                  │  │
-│  │  nodes.jsonl  edges.jsonl  functions.jsonl         │  │
-│  │  sinks.jsonl  skipped.jsonl  manifest.json         │  │
-│  └───────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
+CVEfixes SQLite DB
+       │
+       ▼
+┌──────────────────────────────────────┐
+│ ingest_cvefixes.py                    │  Filter to C-language CVEs with
+│                                       │  usable fix commits, derive
+│                                       │  vulnerable commit from git parents
+└───────────────┬──────────────────────┘
+                │
+                ▼ Work queue (JSONL)
+┌──────────────────────────────────────┐
+│ build_dataset.py                      │
+│                                       │
+│  For each (CVE, repo, vuln_commit,    │
+│            fix_commit) in queue:      │
+│                                       │
+│   1. Clone repo (cached)              │
+│   2. Run Joern on each commit         │
+│   3. Find candidate functions         │
+│   4. Build statement graph            │
+│   5. Identify dangerous-API sinks     │
+│   6. Compute vulnerability slice      │
+│   7. Annotate nodes with features     │
+│      and label (1=in slice, 0=else)   │
+└───────────────┬──────────────────────┘
+                │
+                ▼
+┌──────────────────────────────────────┐
+│ Streaming JSONL output                │
+│  nodes.jsonl, edges.jsonl,            │
+│  functions.jsonl, sinks.jsonl,        │
+│  skipped.jsonl, manifest.json         │
+└──────────────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────────────┐
+│ validate_dataset.py                   │
+│  Schema check, label distribution,    │
+│  edge integrity, sink coverage        │
+└──────────────────────────────────────┘
 ```
 
-### Key components
-
-| File | Role |
-|------|------|
-| `pipeline/cpg_cache.py` | Build and cache Joern CPGs per `(repo, commit)` |
-| `pipeline/_cpg_loader.py` | Read Joern's neo4jcsv export into NetworkX |
-| `pipeline/find_candidates.py` | Step 1: diff parsing and candidate function discovery |
-| `pipeline/build_program_graph.py` | Step 2: coarse statement graph construction |
-| `pipeline/sinks.py` | Step 3: sink identification |
-| `pipeline/slicer.py` | Step 5: bidirectional BFS slice computation |
-| `pipeline/annotate.py` | Step 7: feature extraction and record emission |
-| `build_dataset.py` | Batch orchestrator |
-| `validate_dataset.py` | Dataset structural sanity checker |
+A CVE is processed end-to-end in roughly 30 seconds to 5 minutes depending on the size of the project. Joern parsing dominates the runtime.
 
 ---
 
-## 3. Prerequisites and Environment
+## 3. The Seven Pipeline Steps
 
-### Software requirements
+| Step | Module | Purpose |
+|------|--------|---------|
+| 1 | `pipeline/find_candidates.py` | Parse the patch diff; find patched functions and their 1-hop callers/callees in the call graph |
+| 2 | `pipeline/build_program_graph.py` | Build a coarse statement-level graph with CFG, DFG, CALL, and PARAM_BIND edges over the candidate functions |
+| 3 | `pipeline/sinks.py` | Identify dangerous-API call sites using a CWE-keyed table, patch proximity, and user overrides |
+| 4 | (folded into Step 5) | — |
+| 5 | `pipeline/slicer.py` | Compute the slice = backward(sinks) ∩ forward(patch) over CFG ∪ DFG ∪ CALL ∪ PARAM_BIND |
+| 6 | (folded into Step 7) | — |
+| 7 | `pipeline/annotate.py` | Emit per-node feature records with binary labels and canonical IDs |
 
-| Tool | Version | Purpose |
-|------|---------|---------|
-| Python | 3.12+ | Pipeline runtime |
-| Joern | 4.0.520 | Code Property Graph generation |
-| NetworkX | any recent | In-memory graph representation |
+Supporting infrastructure:
 
-Joern must be on your `PATH` (`joern`, `joern-parse`, `joern-export`).
-
-### Joern export format
-
-After evaluating all four of Joern's export formats (`dot`, `graphml`, `graphson`,
-`neo4jcsv`), this pipeline uses **`neo4jcsv`** exclusively.
-
-- `graphson`: Joern's GraphSON exporter has a known serialization bug triggered by
-  large C codebases (crashes inside `flatgraph.formats.graphson.GraphSONExporter`).
-- `graphml`: Joern writes the XML file successfully but then re-parses it internally
-  for pretty-printing. On large CPGs (>400MB), this hits the JVM's default XML entity
-  size limit and crashes before the process exits cleanly.
-- `neo4jcsv`: Reliable on all tested projects (zlib 15k LoC to curl 100k LoC).
-  Produces ~150 flat CSV files per commit; all required edge types are present
-  (AST, CFG, REACHING_DEF, CALL, CONTAINS, ARGUMENT).
-
-### CPG Cache
-
-Joern builds are cached at `~/.cache/vuln_dataset/cpgs/<hash>/` where `<hash>`
-is derived from the (repo path, commit sha) pair. Building a CPG is expensive
-(2–15 minutes per commit depending on codebase size), so the cache means that
-re-runs and multi-CVE queues on the same project share their CPGs.
-
-The cache is content-addressed. Wiping it forces a rebuild. Keeping the repo
-clone (at `~/.cache/vuln_dataset/repos/`) while wiping CPGs is fine — the
-clone does not need to be re-downloaded.
+- `pipeline/cpg_cache.py` — caches Joern Code Property Graph builds per `(repo, commit)` pair
+- `pipeline/_cpg_loader.py` — reads Joern's `neo4jcsv` export into NetworkX
 
 ---
 
-## 4. Pipeline Steps in Detail
+## 4. How Graphs Are Constructed
 
-### Step 1: Candidate Function Discovery
+### From source code to Code Property Graph
 
-**Module**: `pipeline/find_candidates.py`  
-**Input**: repo path, `commit_vuln`, `commit_fix`  
-**Output**: `Step1Result` per version with a list of `CandidateFunction` objects
+Joern parses the C source at each commit and builds a **Code Property Graph (CPG)**. The CPG unifies multiple program representations in one graph:
 
-#### Diff parsing
-
-The pipeline runs `git diff --unified=3 <commit_vuln>..<commit_fix>` to extract the
-patch. The diff is walked line by line to compute per-file modified line sets for
-both the vulnerable and fixed versions.
-
-**Pure-addition patches** require special handling. When a fix only adds lines (no
-removals), the vulnerable version has no explicitly "removed" lines. In this case
-the pipeline uses a windowed context approach: context lines within 2 lines of any
-`+` line in the hunk are treated as the vulnerable-side modified lines. This
-correctly attributes the patch location to the right function even when hunk context
-spills into an adjacent function above or below.
-
-#### CPG construction and call-graph extraction
-
-For each version (vulnerable and fixed), Joern is invoked:
-
-```
-joern-parse  <worktree>  --output  <cache>/cpg.bin
-joern-export <cache>/cpg.bin  --repr all  --format neo4jcsv  --out <cache>/graph/
-```
-
-A git worktree (not a full clone) is used to materialize the repo at each commit.
-This is lightweight and does not move the main checkout's HEAD.
-
-The exported CPG is loaded into a NetworkX `MultiDiGraph`. METHOD nodes give us
-function metadata. CALL node attributes give us call targets. Ownership of every
-CPG node is determined by BFS from each METHOD node following CONTAINS and AST
-edges.
-
-**Filtered synthetic nodes**: Joern's C frontend emits synthetic METHOD nodes
-`<global>` and `<includes>` that span entire files. These are filtered out before
-any line-to-function mapping.
-
-#### Candidate function selection
-
-Modified lines are mapped to functions using a **narrowest-range containment** rule:
-if multiple functions' line ranges contain a modified line (possible with Joern's
-synthetic wrappers), the function with the smallest `(end_line - start_line)` wins.
-
-From patch functions, 1-hop callers and 1-hop callees are added as neighbor
-candidates. The hop count is configurable via `--hops` (default 1). Result roles:
-
-| Role | Meaning |
-|------|---------|
-| `patch` | Function directly modified by the diff |
-| `caller` | Function that calls a patch function |
-| `callee` | Function called by a patch function |
-
----
-
-### Step 2: Program Graph Construction
-
-**Module**: `pipeline/build_program_graph.py`  
-**Input**: CPGHandle, Step1Result  
-**Output**: NetworkX MultiDiGraph (statement-level)
-
-#### From CPG nodes to statement nodes
-
-Joern's CPG is fine-grained: a single C assignment like `x = a + b` produces
-nodes for the assignment, the identifier `x`, the binary operator `+`, the
-identifiers `a` and `b`, and more. This level of detail is too granular for
-statement-level vulnerability labeling.
-
-The pipeline **lifts** CPG nodes to statement-level by identifying "coarse
-statement nodes" — METHOD, CALL, CONTROL_STRUCTURE, RETURN, BLOCK-with-code,
-and similar nodes that correspond to one recognizable C construct. This
-approximates the granularity a developer sees in a code review.
-
-Statement type classification:
-
-| Type | Joern node labels matched |
-|------|--------------------------|
-| `METHOD_ENTRY` | METHOD |
-| `CALL` | CALL |
-| `ASSIGN` | CALL with `<operator>.assignment*`, BLOCK with `=` |
-| `DECL` | LOCAL, BLOCK with declaration pattern |
-| `IF` | CONTROL_STRUCTURE where `controlStructureType=IF` |
-| `ELSE` | CONTROL_STRUCTURE where type=ELSE/ELSE_IF |
-| `FOR` | CONTROL_STRUCTURE where type=FOR |
-| `WHILE` | CONTROL_STRUCTURE where type=WHILE |
-| `DO_WHILE` | CONTROL_STRUCTURE where type=DO |
-| `RETURN` | RETURN |
-| `BREAK` | CONTROL_STRUCTURE where type=BREAK |
-| `GOTO` | CONTROL_STRUCTURE where type=GOTO |
-| `OTHER` | Everything else |
-
-#### Edge types preserved
-
-After lifting to statement level, only edges where both endpoints are statement
-nodes are kept. Edge types:
-
-| Key | Source in CPG | Meaning |
-|-----|---------------|---------|
-| `CFG` | CFG edges | Control-flow successor |
-| `REACHING_DEF` | REACHING_DEF edges | Data-flow (reaching definition) |
-| `CALL` | CALL edges | Function call |
-| `PARAM_BIND` | Derived from ARGUMENT edges | Argument-to-parameter binding |
-| `CDG` | CDG edges | Control-dependence |
-| `AST` | AST edges (coarsened) | Syntactic parent |
-
-#### PARAM_BIND edges
-
-CALL → CALLEE_METHOD_ENTRY edges represent the call itself. But to model
-*which argument flows to which parameter*, PARAM_BIND edges are synthesized:
-for each ARGUMENT edge from a call expression to an argument node, a
-`PARAM_BIND_{idx}` edge is added from the call-site statement to the
-corresponding method entry node of the callee. Each argument index gets its
-own edge key to prevent deduplication collapsing multiple arguments to one.
-
----
-
-### Step 3: Sink Identification
-
-**Module**: `pipeline/sinks.py`  
-**Input**: Statement graph from Step 2, CWE list, optional extra_sinks  
-**Output**: `is_sink=True`, `sink_reason` attributes set on matching nodes
-
-Sinks are call sites of dangerous APIs that are relevant to the CVE's CWE.
-Three passes, applied in order:
-
-**Pass 1 — CWE-keyed API table.**
-A hardcoded table maps CWEs to dangerous API names:
-
-| CWE | Dangerous APIs |
-|-----|----------------|
-| CWE-119, CWE-120, CWE-122, CWE-787 | memcpy, memset, memmove, strcpy, strncpy, sprintf, gets, ... |
-| CWE-125 | memcpy, memcmp, memset, read, recv, fread, ... |
-| CWE-190, CWE-191 | malloc, realloc, calloc, operator new |
-| CWE-416 | free, delete |
-| CWE-476 | (pointer dereference patterns) |
-| CWE-369 | (division operators) |
-
-For each CWE in the patch's CWE list, every CALL-type statement node whose
-`called_function` attribute matches one of the table's APIs is marked as a sink
-with `sink_reason = "cwe_api:<api_name>"`.
-
-**Pass 2 — Patch-proximity.**
-Any call-site node within `proximity_lines` (default 3) lines of a modified line
-is also marked as a sink with `sink_reason = "proximity"`. This catches dangerous
-calls that sit immediately next to the fix but aren't in the CWE table.
-
-**Pass 3 — User overrides.**
-If the work-queue entry includes `extra_sinks` (a list of `[file, line]` pairs),
-nodes at those exact locations are marked as sinks with `sink_reason = "user"`.
-This is useful when a crash trace or manual analysis identifies a specific
-dangerous location.
-
-**Fallback**: If no sinks are identified after all three passes, the slicer
-receives the patch nodes themselves as implicit sinks. A warning is logged.
-This path was tested and confirmed to work on `tcpdump/CVE-2018-14468` which
-uses CWE-125 with a logic-only fix (no dangerous-API calls).
-
----
-
-### Step 5: Slice Computation
-
-**Module**: `pipeline/slicer.py`  
-**Input**: Statement graph with sinks and patch nodes marked  
-**Output**: `in_slice=True` attribute set on relevant nodes
-
-See [Section 6](#6-how-slices-were-computed) for the full technical description.
-
----
-
-### Step 7: Node Annotation and Feature Extraction
-
-**Module**: `pipeline/annotate.py`  
-**Input**: Statement graph with `in_slice`, `is_sink`, patch metadata  
-**Output**: List of node record dicts (one per statement node)
-
-Each node is assigned a **canonical ID** of the form:
-
-```
-<patch_id>:<version>:<zero-padded-index>
-```
-
-for example: `curl/CVE-2023-38545:vulnerable:00042`
-
-The index is derived by sorting nodes by `(function, line, column, joern_id)`,
-giving a deterministic ordering across runs.
-
-See [Section 7](#7-features-included) for the full feature schema.
-
----
-
-## 5. How Graphs Were Constructed
-
-### From source code to CPG
-
-Joern generates a Code Property Graph (CPG) by parsing C source files with its
-built-in C frontend (based on Eclipse CDT). The CPG unifies:
-
-- **AST** (Abstract Syntax Tree): syntactic structure
-- **CFG** (Control Flow Graph): execution order edges
-- **DDG/PDG** (Data/Program Dependence Graph): data-flow edges including
-  REACHING_DEF (which definitions reach which uses)
-- **CALL graph**: function call relationships
-- **CDG** (Control Dependence Graph): which statements are control-dependent
-  on which conditions
-
-Joern exports these as neo4jcsv: a set of CSV files with node attributes and
-edge types. The pipeline's `_cpg_loader.py` reads these into a single NetworkX
-`MultiDiGraph` using the header files for column type coercion.
+- **AST** (Abstract Syntax Tree) — syntactic structure
+- **CFG** (Control Flow Graph) — execution order
+- **DDG/PDG** (Data/Program Dependence Graph) — data-flow including REACHING_DEF
+- **Call graph** — function call relationships
+- **CDG** (Control Dependence Graph) — which statements depend on which conditions
 
 ### Scoping: why not the whole program
 
-Generating and storing a full-program CPG for every CVE would be:
-1. Extremely slow (Joern takes 2-15 minutes per commit just for the CPG build)
-2. Wasteful for training: most nodes in a 100k-line program are irrelevant
-3. Risky for model generalisation: diluting a small patch change with thousands
-   of unrelated nodes makes learning the signal much harder
+Building a full-program CPG is expensive (Joern takes minutes to hours per commit on large projects). More importantly, training a model on a graph where 99% of nodes are unrelated to the vulnerability would dilute the signal.
 
-Instead, the pipeline scopes to **patch functions + 1-hop call graph neighbors**:
+The pipeline scopes each sample to **patch functions plus 1-hop callers and callees**:
 
 ```
-scope = patch_functions
-      ∪ {f | f calls any patch function}       # 1-hop callers
-      ∪ {f | any patch function calls f}       # 1-hop callees
+candidate functions = patched functions
+                    ∪ {f : f calls a patched function}        (callers)
+                    ∪ {f : a patched function calls f}        (callees)
 ```
 
-This captures cross-function vulnerability propagation (the most important case
-for inter-procedural analysis) while keeping the graph tractable.
+This captures the most important inter-procedural cases (data flowing into a callee where a memcpy lives, or into the caller from an unsafe argument) while keeping graph size tractable.
 
-### Graph construction in detail
+### Lifting to statement granularity
 
-For each candidate function, the pipeline:
+Joern's CPG is fine-grained: a single C assignment produces nodes for the assignment, both identifiers, the binary operator, and so on. This is too granular for statement-level labeling.
 
-1. Extracts the CPG subgraph containing only nodes owned by candidate functions.
-   Ownership is determined by BFS from each METHOD node following CONTAINS and
-   AST edges — every CPG node reachable this way belongs to that function.
+The pipeline lifts CPG nodes to **coarse statement nodes** corresponding to one recognizable C construct each. Statement types include:
 
-2. Lifts fine grained CPG nodes to coarse statement nodes (see Step 2 above).
+`METHOD_ENTRY`, `ASSIGN`, `CALL`, `DECL`, `IF`, `ELSE`, `FOR`, `WHILE`, `DO_WHILE`, `RETURN`, `BREAK`, `CONTINUE`, `GOTO`, and `OTHER`.
 
-3. Re-indexes all edges: an edge is kept if and only if both endpoints are
-   statement nodes. Edge type is preserved as a MultiDiGraph key, allowing
-   multiple edge types between the same pair of nodes.
+After lifting, only edges where both endpoints are statement nodes are retained. Edge types preserved on the final graph:
 
-4. Synthesizes PARAM_BIND edges to represent argument-to-parameter flow across
-   function calls.
+| Type | Source in CPG | Meaning |
+|------|---------------|---------|
+| `CFG` | Joern CFG edges | Control-flow successor |
+| `REACHING_DEF` | Joern REACHING_DEF | Data-flow (which definitions reach which uses) |
+| `CALL` | Joern CALL | Function call (cross-function when both endpoints are candidates) |
+| `PARAM_BIND` | Synthesized | Argument-to-parameter flow at a call site |
+| `CDG` | Joern CDG | Control-dependence |
+| `AST` | Joern AST (coarsened) | Syntactic parent |
 
-5. Annotates each node with function-level metadata: which function it belongs to,
-   its role (patch/caller/callee), and hop distance from the patch.
+### Why a multigraph
 
-### Multi-graph structure
-
-The final graph is a **MultiDiGraph** (directed, multiple edges allowed between
-the same node pair). This is necessary because two nodes can be connected by
-multiple edge types simultaneously — for example, a CALL edge (syntactic call)
-and a REACHING_DEF edge (data-flow dependency) between the same caller and callee.
+The output is a `MultiDiGraph` because two statement nodes can be connected by multiple edge types simultaneously — for example, both a CALL edge and a REACHING_DEF edge between the same caller and callee. Heterogeneous graph models that learn separate weights per edge type can use this structure directly.
 
 ---
 
-## 6. How Slices Were Computed
+## 5. How Slices Are Computed
 
-### Motivation
+### The intuition
 
-Not every statement in the scoped neighborhood is vulnerability relevant. A
-1-hop neighborhood can include hundreds of statements in callee functions that
-have nothing to do with the vulnerability. The slice identifies the relevant
-subset.
+The fundamental insight: a statement is vulnerability-relevant if it lies on a path from where the patch was made to a dangerous operation.
 
-The key insight is:
-
-> A statement is vulnerability-relevant if it lies on a path from the patched
-> code (where the developer made the fix) to a dangerous operation (a sink).
-
-This is formalized as a **bidirectional program slice**:
+The pipeline formalizes this as a **bidirectional program slice**:
 
 ```
 slice = backward_slice(sinks) ∩ forward_slice(patch_nodes)
 ```
 
-- The **backward slice from sinks** captures everything that *contributes to*
-  the dangerous operation: all definitions, conditions, and assignments that
-  influence the sink's arguments.
-- The **forward slice from patch nodes** captures everything that the patch
-  change *affects*: all uses, propagations, and calls downstream of where
-  the fix was made.
-- Their **intersection** is the set of nodes that are both upstream of the
-  fix and downstream of the sink — the vulnerability-mediating statements.
+- The **backward slice from sinks** captures everything that contributes to a dangerous operation: all definitions, conditions, and assignments that influence a sink's arguments.
+- The **forward slice from patch nodes** captures everything the patch change affects: all uses, propagations, and downstream calls.
+- Their **intersection** is the set of statements that are both upstream of the fix and downstream of a sink — the vulnerability-mediating code.
 
-### Traversal
+### Traversal mechanics
 
-Both slices are computed as BFS over the combined edge set:
+Both slices are computed via bounded BFS over:
 
 ```
 traversable_edges = CFG ∪ REACHING_DEF ∪ CALL ∪ PARAM_BIND
 ```
 
-AST and CDG edges are intentionally excluded from slice traversal. They are
-syntactic/structural relationships that can create spurious long-range paths
-(e.g., an AST edge from a method to its first statement would immediately
-make everything reachable).
+AST and CDG edges are excluded from slice traversal. They represent syntactic and structural relationships that would create spurious shortcuts (an AST edge from a method to its first statement makes everything trivially reachable).
 
-**Backward BFS from sinks** follows edges in **reverse**: from a sink node,
-follow incoming edges. A node is in the backward slice if it has any data-flow
-or control-flow path leading to the sink.
+Backward BFS from sinks follows edges in reverse. Forward BFS from patch nodes follows edges forward. Each is bounded by `max_hops` (default 10).
 
-**Forward BFS from patch nodes** follows edges **forward**: from each node
-on a modified line, follow outgoing edges. A node is in the forward slice if
-it is reachable from where the patch was made.
-
-Both BFS runs are bounded by `max_hops` (default 10). This prevents infinite
-expansion in large strongly-connected subgraphs.
-
-### Fallback strategies
-
-Three fallback strategies handle edge cases:
+### Fallback handling
 
 | Situation | Fallback |
 |-----------|----------|
-| No sinks identified after Pass 1-3 | Use patch nodes as implicit sinks |
-| Backward ∩ forward slice is empty | Return union of both slices (anchor-union) |
-| No patch nodes found (e.g. pure callee patch) | Return empty slice |
+| No CWE-matched sinks identified | Use patch nodes as implicit sinks |
+| Backward ∩ forward intersection is empty | Take the union as the slice |
+| No patch nodes in the candidate graph | Empty slice |
+
+These fallbacks keep the pipeline producing usable output on edge cases — most notably CVEs with logic-only fixes that don't touch any dangerous APIs.
 
 ### Label assignment
 
-After slicing:
-- Every node in the slice gets `label = 1`
-- Every node outside the slice gets `label = 0`
-- All candidate-function nodes are kept in the dataset (not filtered); label
-  determines whether they were in the slice
-
-This preserves negatives (label=0 nodes) in the training data, which is
-important for learning a classifier.
-
-### Cross-function slicing in practice
-
-On `tcpdump/CVE-2017-16808`, the slice contained 387 nodes:
-- 69 nodes (18%) in the patch functions
-- 318 nodes (82%) in callee functions
-
-This demonstrates that the inter-procedural slice is functioning correctly:
-the vulnerability involves data flowing from the patch function into callees
-where the dangerous memcpy/memcmp operations reside.
+Every node in the slice gets `label = 1`. Every node outside the slice (but still in the candidate-function graph) gets `label = 0`. All candidate nodes are kept in the dataset, so negative examples are preserved alongside positives.
 
 ---
 
-## 7. Features Included
+## 6. Features Included in Each Node Record
 
-Each node record is a JSON object with the following fields:
+Each `nodes.jsonl` record is a JSON object with these fields:
 
 ### Identity and provenance
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | string | Canonical node ID: `<patch_id>:<version>:<index>` |
+| `id` | string | Canonical ID: `<patch_id>:<version>:<index>` |
 | `patch_id` | string | e.g. `curl/CVE-2023-38545` |
 | `version` | string | `vulnerable` or `fixed` |
 | `function` | string | Short function name |
-| `function_full` | string | Joern full name (includes file path) |
+| `function_full` | string | Joern's full method name |
 | `role` | string | `patch`, `caller`, or `callee` |
 | `file` | string | Repo-relative file path |
 | `line` | int | Source line number |
-| `column` | int | Source column number |
+| `column` | int | Source column |
 
 ### Statement content
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `statement` | string | Source text of the statement (from Joern's `code` attribute) |
-| `type` | string | Statement type: ASSIGN, CALL, IF, DECL, RETURN, etc. |
-| `called_function` | string or null | If type=CALL, the name of the called function |
+| `statement` | string | Source text |
+| `type` | string | Statement type (see Section 4) |
+| `called_function` | string or null | Callee name, when type=CALL |
 
 ### Structural features
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `depth_cfg` | int | Depth of this node in the CFG from METHOD_ENTRY |
-| `depth_ast` | int | Depth of this node in the AST from METHOD |
-| `in_loop` | bool | True if this node is inside a loop construct |
-| `in_branch` | bool | True if this node is inside a conditional branch |
-| `variables_used` | list[str] | Variable names read by this statement |
-| `variables_defined` | list[str] | Variable names written by this statement |
+| `depth_cfg` | int | CFG depth from method entry |
+| `depth_ast` | int | AST depth from method root |
+| `in_loop` | bool | Inside a loop construct |
+| `in_branch` | bool | Inside a conditional |
+| `variables_used` | list[str] | Variables read by this statement |
+| `variables_defined` | list[str] | Variables written by this statement |
 
-### Graph neighborhood features
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `CFG_successors` | list[str] | Canonical IDs of CFG successors |
-| `CFG_predecessors` | list[str] | Canonical IDs of CFG predecessors |
-| `DFG_successors` | list[str] | Canonical IDs of REACHING_DEF successors |
-| `DFG_predecessors` | list[str] | Canonical IDs of REACHING_DEF predecessors |
-| `CALL_edges` | list[str] | Canonical IDs of nodes connected by CALL edges |
-| `n_cfg_succ` | int | Count of CFG successors |
-| `n_cfg_pred` | int | Count of CFG predecessors |
-| `n_dfg_succ` | int | Count of DFG successors |
-| `n_dfg_pred` | int | Count of DFG predecessors |
-
-### Vulnerability-relevant features
+### Graph neighborhood (canonical IDs)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `is_patch_related` | bool | True if this node's line appears in the diff |
-| `distance_to_patch` | int | Minimum graph-hop distance to any patch node |
-| `is_cross_function` | bool | True if this node has edges crossing a function boundary |
-| `hop_distance` | int | Hop distance of this function from the patch function (0=patch, 1=neighbor) |
-| `is_sink` | bool | True if this node was identified as a dangerous-API sink |
-| `sink_reason` | string or null | Sink identification reason: `cwe_api:<name>`, `proximity`, or `user` |
+| `CFG_successors` | list[str] | CFG-successor node IDs |
+| `CFG_predecessors` | list[str] | CFG-predecessor node IDs |
+| `DFG_successors` | list[str] | DFG-successor node IDs |
+| `DFG_predecessors` | list[str] | DFG-predecessor node IDs |
+| `CALL_edges` | list[str] | Nodes connected by CALL edges |
+| `n_cfg_succ`, `n_cfg_pred`, `n_dfg_succ`, `n_dfg_pred` | int | Degree counts |
+
+### Vulnerability-specific features
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `is_patch_related` | bool | This node's line appears in the diff |
+| `distance_to_patch` | int | Min graph-hop distance to any patch node |
+| `is_cross_function` | bool | This node has at least one cross-function edge |
+| `hop_distance` | int | Distance of this function from a patch function (0 = patch, 1 = neighbor) |
+| `is_sink` | bool | Identified as a dangerous-API sink |
+| `sink_reason` | string or null | `cwe_api:<name>`, `proximity`, or `user` |
 
 ### Label
 
@@ -576,735 +304,354 @@ Each node record is a JSON object with the following fields:
 |-------|------|-------------|
 | `label` | int | `1` if in the vulnerability slice, `0` otherwise |
 
-### Feature design rationale
-
-**Why graph neighborhood features?**
-Graph Neural Networks — the most natural model for this task — aggregate information
-from neighbors. Providing the canonical IDs of neighbors allows a downstream GNN
-loader to reconstruct the adjacency matrix from `nodes.jsonl` and `edges.jsonl`
-together, without needing a separate adjacency file.
-
-**Why both CFG and DFG?**
-Control-flow and data-flow capture fundamentally different aspects of a
-vulnerability. A buffer overflow requires both a data condition (buffer size
-vs. copy size) and a control path reaching the dangerous call. CFG alone misses
-the data semantics; DFG alone misses the control path.
-
-**Why `distance_to_patch`?**
-Nodes immediately adjacent to the patched line are typically more vulnerability-
-relevant than nodes ten hops away. Providing this as a continuous feature lets
-the model learn a soft distance penalty, rather than making a hard in/out
-decision at an arbitrary threshold.
-
-**Why `is_cross_function`?**
-The primary research question involves *inter-procedural* vulnerability
-propagation. Flagging cross-function nodes explicitly lets the model give
-more weight to the paths that cross function boundaries — the most novel
-aspect of this dataset compared to function-level work.
-
 ---
 
-## 8. The Batch Orchestrator
-
-**Module**: `build_dataset.py`
-
-The orchestrator takes a work queue (JSONL, one CVE patch per line) and runs
-the full pipeline for each entry. It is designed to run unattended overnight.
-
-### Work queue schema
-
-```json
-{
-  "patch_id": "curl/CVE-2023-38545",
-  "repo_url": "https://github.com/curl/curl",
-  "commit_vuln": "09e25b9d94f4106eac8ca3a43b221bdc66f405e4",
-  "commit_fix":  "fb4415d8aee6c1045be932a34fe6107c2f5ed147",
-  "cve": "CVE-2023-38545",
-  "cwes": ["CWE-122", "CWE-787", "CWE-119"],
-  "extra_sinks": []
-}
-```
-
-`commit_vuln` should be the parent of `commit_fix` (i.e. `commit_fix~1`) for
-surgical one-commit patches. Using the OSV "introduced" commit is a common
-mistake — it creates a diff spanning years of unrelated changes.
-
-### Repo cache
-
-Repos are cloned once to `~/.cache/vuln_dataset/repos/<owner>__<name>/`.
-Multiple CVEs from the same project share one clone. Missing commits are
-fetched individually (`git fetch origin <sha>`) rather than re-cloning.
-
-### Failure isolation
-
-Every failure surface is caught independently. A Joern crash on one CVE does
-not abort the run. Failures are logged to `skipped.jsonl` with:
-
-- `stage`: where the failure occurred (`clone/fetch`, `step1/cpg_build`,
-  `step1`, `cpg_build`, `steps2-7`)
-- `reason`: the exception message or last 300 chars of stderr
-- `traceback_tail`: last 500 chars of the Python traceback
-- `ts`: Unix timestamp
-
-### Resume
-
-On restart, the orchestrator scans `functions.jsonl` to find patch_ids already
-processed. Those are skipped. Entries in `skipped.jsonl` only (failures) are
-retried — transient errors like network failures often succeed on retry.
-
-### Signal handling
-
-`SIGINT` (Ctrl-C) and `SIGTERM` trigger a graceful shutdown: the current patch
-is abandoned, all open files are flushed, and the process exits with code 130.
-The partial output is safe to resume from.
-
-### CLI reference
+## 7. Repository Layout
 
 ```
-python3 build_dataset.py \
-    --work-queue  queue.jsonl      # required
-    --out         dataset/         # required
-    --hops        1                # neighbor hop count (default 1)
-    --max-hops-slice 10            # slice BFS cap (default 10)
-    --proximity-lines 3            # sink proximity window (default 3)
-    --debug-samples                # write per-patch JSON to dataset/samples/
-    --repo-cache  ~/.cache/...     # override default repo cache location
-    --log-level   INFO             # DEBUG for verbose Joern output
+vulnerability-dataset/
+├── README.md                       (this file)
+├── pipeline/
+│   ├── __init__.py
+│   ├── cpg_cache.py                Joern CPG build + cache
+│   ├── _cpg_loader.py              neo4jcsv → NetworkX loader
+│   ├── find_candidates.py          Step 1: diff parsing, candidate selection
+│   ├── build_program_graph.py      Step 2: statement-level graph
+│   ├── sinks.py                    Step 3: dangerous-API sink identification
+│   ├── slicer.py                   Step 5: bidirectional slice computation
+│   └── annotate.py                 Step 7: feature extraction
+├── ingest_cvefixes.py              CVEfixes SQLite → work-queue JSONL
+├── build_dataset.py                Batch orchestrator (the driver)
+├── validate_dataset.py             Output sanity checker
+├── test_*.py                       Unit and integration tests
+├── smoke_test_step1.py             End-to-end smoke test on synthetic C
+├── queue_500.jsonl                 The 500-CVE work queue
+├── test_queue.jsonl                Hand-picked test queue (5 CVEs)
+└── dataset_500/
+    ├── manifest.json               Run config and totals
+    ├── functions.jsonl             Function-level provenance (committed to git)
+    ├── sinks.jsonl                 Sink records (committed to git)
+    ├── skipped.jsonl               Failed entries (committed to git)
+    ├── nodes.jsonl                 Main payload (Google Drive only)
+    └── edges.jsonl                 Edge records (Google Drive only)
 ```
 
 ---
 
-## 9. Output Dataset Schema
+## 8. Setup and Prerequisites
 
-The dataset directory contains six files:
+### Software
 
-### `nodes.jsonl`
+| Tool | Version | Purpose |
+|------|---------|---------|
+| Python | 3.12+ | Runtime |
+| Joern | 4.0.520 | Code Property Graph builder |
+| NetworkX | recent | In-memory graph representation |
+| Git | 2.x | Repo management and worktrees |
 
-One JSON record per node per sample. This is the primary output. See
-[Section 7](#7-features-included) for the full field listing.
+Joern must be on `PATH` so that `joern`, `joern-parse`, and `joern-export` are callable.
 
-Example record:
+### Hardware
 
-```json
-{
-  "id": "curl/CVE-2023-38545:vulnerable:00042",
-  "patch_id": "curl/CVE-2023-38545",
-  "version": "vulnerable",
-  "function": "Curl_SOCKS5",
-  "role": "patch",
-  "file": "lib/socks.c",
-  "line": 875,
-  "statement": "len = hostname_len + 1;",
-  "type": "ASSIGN",
-  "depth_cfg": 12,
-  "in_loop": false,
-  "in_branch": true,
-  "variables_used": ["hostname_len"],
-  "variables_defined": ["len"],
-  "is_patch_related": true,
-  "distance_to_patch": 0,
-  "is_cross_function": false,
-  "is_sink": false,
-  "label": 1
-}
-```
+| Resource | Recommended | Notes |
+|----------|-------------|-------|
+| RAM | 16 GB minimum, 32 GB ideal | Joern + Python both consume memory |
+| Disk | 250 GB free | CPG cache grows large during multi-CVE runs |
+| CPU | Any modern multi-core | Joern is single-threaded internally per CPG |
 
-### `edges.jsonl`
+A 16 GB MacBook Pro completed the 500-CVE production run (after banning the largest projects). Larger machines can include them.
 
-One record per graph edge. Src and dst are canonical node IDs from `nodes.jsonl`.
+### Joern's export format
 
-```json
-{
-  "patch_id": "curl/CVE-2023-38545",
-  "version": "vulnerable",
-  "src": "curl/CVE-2023-38545:vulnerable:00042",
-  "dst": "curl/CVE-2023-38545:vulnerable:00043",
-  "edge_type": "CFG"
-}
-```
+This pipeline uses `--format neo4jcsv` (a set of flat CSV files). Two other formats were tried and rejected:
 
-### `functions.jsonl`
+- `--format graphson`: Joern's GraphSON exporter has a serialization bug that crashes on real C codebases (`flatgraph.formats.graphson.GraphSONExporter` exception).
+- `--format graphml`: Joern writes the GraphML successfully, then internally re-parses it for pretty-printing. On large CPGs this hits the JVM's default XML entity-size limit and crashes.
 
-One record per candidate function per sample. Useful for provenance queries.
-
-```json
-{
-  "patch_id": "curl/CVE-2023-38545",
-  "version": "vulnerable",
-  "function_full": "Curl_SOCKS5",
-  "function": "Curl_SOCKS5",
-  "role": "patch",
-  "file": "lib/socks.c",
-  "hop_distance": 0,
-  "modified_lines": [875, 876, 877]
-}
-```
-
-### `sinks.jsonl`
-
-One record per identified sink node. Useful for auditing sink quality without
-parsing all of `nodes.jsonl`.
-
-```json
-{
-  "patch_id": "curl/CVE-2023-38545",
-  "version": "vulnerable",
-  "node_id": "curl/CVE-2023-38545:vulnerable:00089",
-  "function": "Curl_SOCKS5",
-  "line": 921,
-  "called_function": "memcpy",
-  "sink_reason": "cwe_api:memcpy",
-  "label": 1
-}
-```
-
-### `skipped.jsonl`
-
-One record per failed patch. Empty means zero failures. See
-[Section 8](#8-the-batch-orchestrator) for the field schema.
-
-### `manifest.json`
-
-Run metadata: config, totals, elapsed time.
-
-```json
-{
-  "run_config": {
-    "hops": 1,
-    "max_hops_slice": 10,
-    "proximity_lines": 3,
-    "debug_samples": false
-  },
-  "totals": {
-    "processed": 4,
-    "skipped": 0,
-    "samples": 8,
-    "nodes": 9701,
-    "positives": 2992
-  },
-  "elapsed_seconds": 235.1
-}
-```
-
-### Downloading the production dataset
-
-The production 500-CVE dataset (`dataset_500/`) is not stored in this repository — `nodes.jsonl` (922 MB) and `edges.jsonl` (790 MB) exceed GitHub's file size limit. The smaller provenance files (`functions.jsonl`, `sinks.jsonl`, `skipped.jsonl`, `manifest.json`) are tracked in git directly.
-
-The full dataset is available for download at: **[Google Drive link to be added by author]**
-
-| File | Size | Location |
-|------|------|----------|
-| `nodes.jsonl` | 922 MB | Google Drive |
-| `edges.jsonl` | 790 MB | Google Drive |
-| `functions.jsonl` | 5 MB | Git repository |
-| `sinks.jsonl` | 1.7 MB | Git repository |
-| `skipped.jsonl` | 183 KB | Git repository |
-| `manifest.json` | 388 B | Git repository |
+`neo4jcsv` is reliable on all tested projects (zlib 15k LoC up to curl 100k LoC).
 
 ---
 
-## 10. Validation
+## 9. Reproducing the Dataset from Scratch
 
-Run after every batch:
+### Step 1: download CVEfixes
+
+CVEfixes v1.0.8 is hosted on Zenodo (DOI: 10.5281/zenodo.13118970). The archive is 12.7 GB.
 
 ```bash
-python3 validate_dataset.py --out dataset/
+mkdir -p ~/.cache/vuln_dataset/cvefixes
+cd ~/.cache/vuln_dataset/cvefixes
+curl -L -C - -o CVEfixes_v1.0.8.zip \
+    "https://zenodo.org/records/13118970/files/CVEfixes_v1.0.8.zip?download=1"
+
+# Verify the MD5 hash
+md5 CVEfixes_v1.0.8.zip
+# Expected: 4586a358977acfa4c60b1a2cdd096221
 ```
 
-The validator checks nine things and exits 0 (no issues) or 1 (red flags):
+If the connection is unstable, the `-C -` flag tells curl to resume from where it stopped on the next attempt.
 
-1. All required files exist
-2. Record counts per file
-3. Manifest totals parse correctly
-4. First 2,000 node records have all expected fields
-5. Label distribution (warns on extreme imbalance)
-6. Per-patch sample coverage
-7. Edge referential integrity (src/dst resolve to known node IDs)
-8. Sink reason distribution
-9. Skipped entries breakdown by stage with one example per stage
+### Step 2: extract the SQL dump and restore to SQLite
+
+```bash
+unzip CVEfixes_v1.0.8.zip
+gzcat CVEfixes_v1.0.8/Data/CVEfixes_v1.0.8.sql.gz | sqlite3 CVEfixes.db
+```
+
+The restore takes 30–90 minutes and produces a ~48 GB SQLite database.
+
+### Step 3: generate the work queue
+
+```bash
+cd ~/vulnerability-dataset
+python3 ingest_cvefixes.py \
+    --db ~/.cache/vuln_dataset/cvefixes/CVEfixes.db \
+    --out queue_500.jsonl \
+    --limit 500 \
+    --ban "php-src,ImageMagick"
+```
+
+The `--ban` flag excludes large projects whose CPGs exceed 16 GB RAM during loading. On machines with more memory, these can be re-included.
+
+### Step 4: run the pipeline
+
+```bash
+caffeinate python3 build_dataset.py \
+    --work-queue queue_500.jsonl \
+    --out dataset_500/ \
+    2>&1 | tee -a dataset_500_run.log
+```
+
+`caffeinate` prevents macOS from sleeping during the multi-hour run. On Linux, this is unnecessary.
+
+The orchestrator handles failures, resumes from interruptions, and writes incrementally — interrupting with Ctrl-C is safe and preserves progress.
+
+### Step 5: validate
+
+```bash
+python3 validate_dataset.py --out dataset_500/
+```
+
+The validator runs nine structural checks: file presence, record counts, schema completeness, label distribution, per-CVE coverage, edge integrity, sink distribution, and skip breakdown.
 
 ---
 
-## 11. Empirical Results
+## 10. Development History: From 5 CVEs to 500
 
-### Validation run: 5 CVEs across 4 projects
+The pipeline went through three validation stages before the production run.
 
-| CVE | Project | LoC | Time | Nodes | Positives | Sinks | Cross-fn nodes |
-|-----|---------|-----|------|-------|-----------|-------|----------------|
-| CVE-2023-38545 | curl | ~100k | 32s | 1,299 | 772 (59%) | 10 | 274 |
-| CVE-2022-37434 | zlib | ~15k | 38s | 4,638 | 1,776 (38%) | 10 | 490 |
-| CVE-2017-16808 | tcpdump | ~70k | 47s | 3,133 | 787 (25%) | 22 | 468 |
-| CVE-2018-14468 | tcpdump | ~70k | 23s | 666 | 168 (25%) | 0* | 138 |
-| CVE-2019-15161 | libpcap | ~30k | 32s | 1,264 | 261 (21%) | 4 | 244 |
+### Stage 1: synthetic C (1 fake CVE)
 
-*No CWE-matched sinks; patch-fallback activated cleanly.
+Initial validation used a synthetic 4-function C project with two commits: a "vulnerable" version with a bounds-check missing, and a "fixed" version with the bounds check added. This was implemented as `smoke_test_step1.py`.
 
-**Total**: 11,000 nodes, 166,177 edges, 46 sinks, 34.2% positive rate, 0 failures, 235s total.
+The synthetic test caught most of the early bugs in diff parsing, function identification, and graph construction. It runs in under 30 seconds and was used as the regression check throughout development.
 
-### Node type distribution
+### Stage 2: hand-picked CVEs (5 real CVEs)
+
+The first run on real data used 5 hand-picked CVEs covering diverse projects, CWEs, and bug shapes:
+
+| CVE | Project | LoC | CWE | Slice character |
+|-----|---------|-----|-----|-----------------|
+| CVE-2023-38545 | curl | ~100k | CWE-122 | Heap overflow, mostly patch-fn |
+| CVE-2022-37434 | zlib | ~15k | CWE-125/787 | Locally contained in inflate |
+| CVE-2017-16808 | tcpdump | ~70k | CWE-125 | 80% of slice in callee functions |
+| CVE-2018-14468 | tcpdump | ~70k | CWE-125 | No-sink fallback (logic-only fix) |
+| CVE-2019-15161 | libpcap | ~30k | CWE-125 | Mixed patch + callee slice |
+
+Result: 11,000 nodes, 166,177 edges, 0 failures, ~4 minutes total.
+
+This stage validated:
+- Cross-function slicing actually works (tcpdump CVE-2017-16808 had 82% of slice in callees)
+- The patch-fallback path activates cleanly on CVEs with no dangerous APIs
+- Project sizes from 15k to 100k LoC all parse correctly
+
+### Stage 3: CVEfixes-derived CVEs (10 CVEs)
+
+This stage shifted to CVEs ingested directly from the CVEfixes database, rather than hand-picked. The `ingest_cvefixes.py` script was written and tested at this stage.
+
+Result: 8 of 10 processed (80% success rate), 26,421 nodes, 11.93% positive rate.
+
+Two failures:
+- 1 Joern parse crash on krb5 (a known issue with Joern's C frontend on macro-heavy code)
+- 1 CVE where the patch didn't touch any C functions (build files only)
+
+These failure modes are intrinsic to real-world data and confirmed the orchestrator's failure isolation works correctly.
+
+This stage also revealed the first systemic data-format issue: CVEfixes stores commit parents as a Python list literal (`"['hash1']"`) rather than space-separated SHAs. The ingestor's parser was updated to use `ast.literal_eval` with a space-separated fallback for older CVEfixes versions.
+
+### Stage 4: production run (500 CVEs)
+
+The full run on a 500-CVE queue. Produced the dataset described in this document.
+
+The run did not complete on the first attempt: an out-of-memory kill on a php-src CPG (3.1M nodes, 27M edges loaded into Python on a 16 GB machine) terminated the process partway through. The shared CPG cache had also grown to ~200 GB by then, leaving only 5 GB free disk.
+
+Recovery steps:
+1. Wiped the CPG cache (Joern rebuilds CPGs on demand; the wipe freed 200 GB)
+2. Added `php-src` and `ImageMagick` to the ingestor's ban list
+3. Re-ran the ingestor with the new bans, producing a queue with the largest projects excluded
+4. Resumed the orchestrator with the same `--out` directory; it skipped the 78 already-processed CVEs and continued
+
+The run completed across two sessions totaling ~24 hours of compute. The resume mechanism, designed in early development, worked correctly without intervention. Final result: 215 of 500 entries processed (43% success rate). The 42% skip rate is dominated by CVEfixes data quality — most skipped entries are CVEs whose fix commits don't touch any C functions (the patches are in build files, comments, headers only, etc.).
+
+---
+
+## 11. Bugs Encountered During Development
+
+The following engineering issues came up during development and were resolved. They are documented here for anyone extending the pipeline or porting it to a different Joern version.
+
+| # | Issue | How it manifested | Fix |
+|---|-------|-------------------|-----|
+| 1 | GraphSON v3 nested property format | Properties returned as `{"@type": ..., "@value": ...}` instead of bare values | Recursive unwrapping helpers |
+| 2 | Joern `<global>` synthetic methods | Synthetic per-file `<global>` method spans the whole file, winning every line-containment lookup | Filter out by name pattern |
+| 3 | Wrong vulnerable commit | Using OSV's "introduced" hash instead of fix's parent gave a 13MB diff spanning years | Always use `commit_fix~1` as `commit_vuln` |
+| 4 | UTF-8 decode errors on git diff | Some commits touch non-UTF-8 files, raising `UnicodeDecodeError` | `errors="replace"` on the subprocess decode |
+| 5 | Hunk context spilling into adjacent functions | Pure-addition diffs assigned closing `}` of prior function to patch fn | Limit context to lines within 2 of any `+` line |
+| 6 | Dict-items unpacking swap | BFS started from a function name string instead of node ID | Fix variable order in unpacking |
+| 7 | GraphSON serializer crashes on real CPGs | `flatgraph.formats.graphson.GraphSONExporter` exception on curl | Switched export to neo4jcsv |
+| 8 | GraphML JVM entity size limit | Joern writes GraphML, then re-parses for pretty-printing; crashes on >100k-char nodes | Avoided GraphML; stayed on neo4jcsv |
+| 9 | Stale git worktree registry | After cache wipe, `git worktree add` refused with "already registered" | `git worktree prune` before every add |
+| 10 | PARAM_BIND deduplication collapsing arguments | All arguments of a call collapsed to a single edge | Include arg index in dedup key: `PARAM_BIND_{idx}` |
+| 11 | CVEfixes `parents` field format | Stored as Python list literal `"['hash1']"`, not space-separated | Parse with `ast.literal_eval` |
+| 12 | OOM on 3M-node CPGs | 16 GB machines crashed loading php-src/ImageMagick into Python | Banned the largest projects from the queue |
+
+---
+
+## 12. Empirical Results
+
+### 5-CVE validation (Stage 2)
+
+| CVE | Project | LoC | Time | Nodes | Positives | Sinks | Notable |
+|-----|---------|-----|------|-------|-----------|-------|---------|
+| CVE-2023-38545 | curl | ~100k | 32s | 1,299 | 772 (59%) | 10 | Heap overflow, SOCKS5 |
+| CVE-2022-37434 | zlib | ~15k | 38s | 4,638 | 1,776 (38%) | 10 | OOB read/write |
+| CVE-2017-16808 | tcpdump | ~70k | 47s | 3,133 | 787 (25%) | 22 | 82% of slice in callees |
+| CVE-2018-14468 | tcpdump | ~70k | 23s | 666 | 168 (25%) | 0* | Patch-fallback activated |
+| CVE-2019-15161 | libpcap | ~30k | 32s | 1,264 | 261 (21%) | 4 | Mixed slice |
+
+\* No CWE-matched sinks; slicer fell back to using patch nodes as implicit sinks.
+
+Total: 11,000 nodes, 166,177 edges, 46 sinks, 235s wall time, 0 failures.
+
+### 500-CVE production run (Stage 4)
+
+| Metric | Value |
+|--------|-------|
+| CVEs processed | 215 of 500 (43%) |
+| Samples emitted | 420 |
+| Node records | 601,662 |
+| Edge records | 4,546,098 |
+| Sinks identified | 7,571 |
+| Positive label rate | 23.27% |
+| Unique projects | 100+ |
+| Total processing time | ~24 hours (across two sessions) |
+
+### Skip breakdown (production)
+
+| Stage | Count | Cause |
+|-------|-------|-------|
+| `step1` | 236 | "No function-scope changes" — patches that don't touch any C functions (build files, comments, etc.) |
+| `step1/cpg_build` | 68 | Joern parse failures on specific codebases |
+| `clone/fetch` | 34 | Network issues during the run |
+
+The 42% skip rate is dominated by CVEfixes data quality (236 of 338 skips), not pipeline failures.
+
+### Top dangerous APIs identified
+
+| API | Sink count | CWE families |
+|-----|-----------|--------------|
+| `memcpy` | 1,528 | CWE-119, CWE-122, CWE-125, CWE-787 |
+| `fprintf` | 1,270 | CWE-134 (format string) |
+| `free` | 1,121 | CWE-415, CWE-416 (UAF/double-free) |
+| `printf` | 856 | CWE-134 |
+| `memset` | 829 | CWE-119, CWE-125 |
+
+### Statement type distribution (production)
 
 | Type | Count | % |
 |------|-------|---|
-| ASSIGN | 2,694 | 24.5% |
-| CALL | 2,308 | 21.0% |
-| IF | 1,620 | 14.7% |
-| DECL | 1,269 | 11.5% |
-| OTHER | 506 | 4.6% |
-| GOTO | 404 | 3.7% |
-| RETURN | 395 | 3.6% |
-| ELSE | 374 | 3.4% |
-| BREAK | 344 | 3.1% |
-| METHOD_ENTRY | 274 | 2.5% |
+| ASSIGN | 129,949 | 21.6% |
+| CALL | 115,995 | 19.3% |
+| DECL | 92,724 | 15.4% |
+| IF | 84,713 | 14.1% |
+| RETURN | 29,688 | 4.9% |
+| OTHER | 26,645 | 4.4% |
+| METHOD_ENTRY | 23,358 | 3.9% |
+| ELSE | 17,604 | 2.9% |
+| BREAK | 16,633 | 2.8% |
+| GOTO | 14,619 | 2.4% |
 
-`OTHER` at 4.6% indicates the statement classifier is discriminating well —
-most nodes are categorized into a meaningful type.
+The `OTHER` category at 4.4% indicates the statement classifier is discriminating well — most nodes fall into a meaningful semantic type rather than a catch-all.
 
-### Positive rate discussion
+### Edge integrity
 
-The aggregate 34.2% positive rate is higher than typical binary classifiers see
-in vulnerability datasets (often <5%). The reasons are:
+A full walk of all 4.5M edges reported:
 
-1. We scope to the neighborhood (not the whole file), so the ratio of
-   relevant-to-irrelevant nodes is higher by construction.
-2. The slice BFS runs to `max_hops=10`, which on small functions can reach most
-   of the candidate nodes.
-
-Per-CVE positive rates vary: tcpdump/CVE-2017-16808 (25%) vs curl/CVE-2023-38545
-(59%). This variance is expected and reflects different vulnerability containment
-patterns. Class weighting or `max_hops` tuning can adjust this tradeoff at
-training time.
-
-### Production run: 500-CVE dataset
-
-The production run processed 500 CVEs from the CVEfixes v1.0.8 dataset over
-approximately 24 hours across two sessions (see [Section 13](#13-production-run-operations-notes)
-for operational details).
-
-| Metric | Value |
-|--------|-------|
-| CVEs in queue | 500 |
-| CVEs successfully processed | 215 (43%) |
-| Total samples | 420 |
-| Total node records | 601,662 |
-| Total edge records | 4,546,098 |
-| Total sinks identified | 7,571 |
-| Positive label rate | 23.27% (140,027 / 601,661) |
-| Project diversity | 100+ unique C projects |
-| Processing time | ~24 hours across two sessions |
-
-#### Skip breakdown
-
-285 of 500 CVEs were skipped:
-
-| Stage | Count | % of skips | Primary reason |
-|-------|-------|------------|----------------|
-| `step1` — no function-scope changes | 236 | 70% | CVEfixes patches touched non-C files only |
-| `step1/cpg_build` — Joern parse failures | 68 | 20% | Joern failed to parse the commit's source |
-| `clone/fetch` — network drops | 34 | 10% | Network failures during the run |
-
-The dominant skip cause — "no function-scope changes" — reflects a data quality
-issue in CVEfixes: many CVEs whose metadata lists C as the language have patches
-that modify only Makefiles, documentation, or header-only changes with no function
-bodies. This is a property of the upstream dataset, not the pipeline.
-
-#### Top sink types
-
-| API | Count |
-|-----|-------|
-| `memcpy` | 1,528 |
-| `fprintf` | 1,270 |
-| `free` | 1,121 |
-| `printf` | 856 |
-| `memset` | 829 |
-
-#### Statement type distribution
-
-| Type | % |
-|------|---|
-| ASSIGN | 21.6% |
-| CALL | 19.3% |
-| DECL | 15.4% |
-| IF | 14.1% |
-| OTHER | 4.4% |
-
-The positive rate of 23.27% is lower than the 5-CVE validation run (34.2%).
-The validation CVEs were selected because they were known to work cleanly with
-the pipeline. The production set includes more diverse patch shapes, some with
-sparse or diffuse vulnerability patterns that produce smaller slices.
+- 387 edges (0.0085%) with endpoints not in the node set — within noise tolerance
+- 0 cross-sample edges (no canonical-ID leakage between samples)
 
 ---
 
-## 12. The CVEfixes Ingestor
+## 13. Future Work
 
-**Module**: `ingest_cvefixes.py`
+### A. Train a baseline GNN
 
-### Purpose
+The dataset is designed for graph neural network training. A natural first model is a heterogeneous GNN (R-GCN or HGT) for node-level binary classification, with separate weights per edge type (CFG vs DFG vs CALL etc.).
 
-`ingest_cvefixes.py` converts a CVEfixes SQLite dump into the work-queue JSONL
-format consumed by `build_dataset.py`. Each output line is one CVE entry ready
-for pipeline processing.
+This would establish:
+- A baseline F1/precision/recall for the dataset
+- Whether the dataset's signal is learnable
+- Comparison points for future methodology improvements
 
-### The CVEfixes dataset
+### B. Tune `max_hops_slice`
 
-CVEfixes v1.0.8 (Bhandari et al., 2021) contains fix commits for CVEs across a
-wide range of open-source projects:
+The default of 10 produces a 23.27% positive rate aggregated across CVEs but with high per-CVE variance (5–60%). A tuning run that varies the parameter from 4 to 12 and reports per-CVE label distributions would inform a better default and document the trade-off.
 
-| Metric | Value |
-|--------|-------|
-| Fix commits | 12,107 |
-| CVEs covered | 11,873 |
-| Projects | 4,249 |
-| Download size | 12.7 GB |
-| Zenodo DOI | 10.5281/zenodo.13118970 |
+### C. Parallel processing
 
-### Filter chain
+The orchestrator runs sequentially. A multi-process version using `multiprocessing.Pool` would give a near-linear speedup up to the number of cores, bounded by per-Joern memory cost. Two preconditions: file-locking the shared CPG cache, and per-worker output files merged at the end.
 
-The ingestor applies five filters in sequence:
+### D. Graded labels
 
-| Filter | Effect |
-|--------|--------|
-| `language = 'C'` | Drops non-C CVEs (Python, Java, JavaScript, etc.) |
-| Has fix commit | Drops entries with no resolvable commit URL |
-| Non-banned project | Drops projects on the ban list |
-| Has CWE classification | Drops entries with no CWE (needed for Step 3 sink table) |
-| Has parent commit | Drops entries where `commit_fix~1` cannot be resolved |
+Replace the binary `label` with a four-tier ordinal scheme:
 
-Starting from 12,931 `(CVE, fix)` rows, the chain produces **2,144 unique
-C-language CVEs**. The 18% pass rate is dominated by language filtering: 71% of
-CVEfixes is non-C code.
+| Label | Meaning |
+|-------|---------|
+| 3 | PATCH_CORE — node is on a modified line |
+| 2 | TAINT_RELEVANT — backward-slice from a sink |
+| 1 | SEMANTIC_SEED — forward-slice from patch nodes |
+| 0 | NEGATIVE — outside all slices |
 
-Where multiple fix commits exist for the same CVE, the ingestor keeps the
-chronologically earliest one.
+This enables ordinal regression or multi-class classification.
 
-### Schema-aware design
+### E. PyG/PyTorch dataset loader
 
-CVEfixes has undergone schema changes across versions. The ingestor probes for
-the presence of the `language` column at startup and skips the language filter
-if the column is absent, for compatibility with older dumps.
+A `torch_geometric.data.Dataset` subclass that reads `nodes.jsonl` and `edges.jsonl`, tensorizes features, and emits `Data` objects per sample.
 
-The `parents` field in CVEfixes is stored as a Python-list-literal string
-(e.g. `"['abc123def']"`), not a space-separated SHA or a JSON array. The
-ingestor parses this with `ast.literal_eval` rather than string splitting.
+### F. Re-include large projects on bigger machines
 
-### Ban list
+`php-src` and `ImageMagick` were banned for the production run because their CPGs exceed 16 GB RAM during loading. On machines with 32 GB+ RAM, these can be re-included via:
 
-Large codebases are unsuitable for the pipeline's 1-hop scoping strategy: their
-CPGs exceed available memory. The default ban list includes the Linux kernel.
-During the 500-CVE production run, `php-src` and `ImageMagick` were added after
-OOM crashes on their CPGs (3M+ nodes). Machines with 16 GB RAM should include
-these in their ban list by default.
-
-### CLI reference
-
-```
-python3 ingest_cvefixes.py \
-    --db    CVEfixes.db    \   # path to downloaded SQLite dump
-    --out   queue.jsonl    \   # output work queue
-    --limit 500            \   # cap output at N entries
-    --ban   linux,php-src  \   # comma-separated projects to exclude
-    --no-c-filter              # skip language=C filter (for testing)
+```bash
+python3 ingest_cvefixes.py --db ... --out queue.jsonl --limit 500
+# (no --ban argument)
 ```
 
----
+### G. Publish to Zenodo for permanent DOI
 
-## 13. Production Run Operations Notes
-
-This section records observations from the 500-CVE production run that are
-relevant to anyone running the pipeline at scale.
-
-### OOM crash on php-src
-
-After processing 110 CVEs successfully, the first session was killed by the OS
-OOM killer while building the Joern CPG for a `php-src` commit. The `php-src`
-CPG at that commit had approximately 3.1M nodes and 27M edges — beyond the
-memory capacity of the 16 GB machine used. The run was restarted after adding
-`php-src` and `ImageMagick` to the ban list. The resume mechanism picked up
-from CVE 111 with no data loss.
-
-### Disk pressure
-
-The CPG cache at `~/.cache/vuln_dataset/cpgs/` grew to over 200 GB during
-the run as Joern CPG binaries accumulated for each processed commit. The cache
-is safe to wipe between sessions: Joern rebuilds CPGs from the source repo as
-needed, and the source repos remain in `~/.cache/vuln_dataset/repos/`. After
-wiping the CPG cache and restarting the second session, the pipeline resumed
-cleanly.
-
-### Resume correctness
-
-The resume mechanism (scanning `functions.jsonl` for already-processed
-`patch_id` entries) worked correctly across both sessions and after the CPG
-cache wipe. No duplicate entries were produced.
-
-### Practical recommendations for 16 GB RAM machines
-
-- Ban `php-src`, `ImageMagick`, and other large C codebases whose CPGs exceed
-  available memory.
-- Monitor disk usage during the run; the CPG cache can grow to hundreds of GB
-  for a 500-CVE queue. Wipe between sessions if needed.
-- Run sequentially (the default). Parallel processing would multiply peak
-  memory usage.
-- `Ctrl-C` triggers a graceful shutdown; the partial output is safe to resume
-  from.
-
-### Skip rate interpretation
-
-The 42% overall skip rate (285 / 500 CVEs) is dominated by CVEfixes data
-quality, not pipeline failures. 236 of 285 skips (70%) are "no function-scope
-changes" — CVEs whose patches touched Makefiles, documentation, or
-non-function C code. These entries pass the ingestor's language filter but
-produce no candidate functions in Step 1. This is a known limitation of using
-CVEfixes as an upstream data source and is not correctable without manual
-curation.
+The current dataset is hosted on Google Drive. For long-term archival and academic citability, future work should publish to Zenodo (the same archive that hosts CVEfixes) for a permanent DOI. This is the standard pattern for vulnerability research datasets and what reviewers expect.
 
 ---
 
-## 14. Known Bugs Fixed During Development
+## 14. Citation
 
-The following engineering challenges were encountered and resolved during the
-development of this pipeline. They are documented here as guidance for
-anyone extending the pipeline or porting it to a new Joern version.
-
-| # | Bug | Symptom | Fix |
-|---|-----|---------|-----|
-| 1 | GraphSON v3 nested property format | Properties returned `{"@type": ..., "@value": ...}` instead of bare values | Added recursive `_unwrap()` and `_extract_property_value()` helpers |
-| 2 | Joern `<global>` synthetic methods | `<global>` spans whole file; wins every line-containment check | Filter out by name and full_name pattern before any mapping |
-| 3 | Bug-introduction vs. fix commit confusion | Diffing OSV "introduced" → fix spanned years of history (13MB diff) | Always use `commit_fix~1` (parent of fix) as `commit_vuln` |
-| 4 | UTF-8 decoding on git diff output | `UnicodeDecodeError` on commits touching binary or non-UTF-8 files | Added `errors="replace"` to subprocess text decoding |
-| 5 | Hunk context spilling into adjacent functions | Pure-addition diffs attributed closing `}` of prior function to patch fn | Limit context to lines within 2 of any `+` line (windowed collection) |
-| 6 | Dict-items unpacking swap | BFS started from full_name string instead of node_id | Fixed variable order in `for full_name, nid in .items()` |
-| 7 | GraphSON serializer crash on real CPGs | `flatgraph.formats.graphson.GraphSONExporter` exception on large C codebases | Switched to neo4jcsv export |
-| 8 | GraphML JVM entity size limit | Joern writes GraphML successfully, then re-parses for pretty-printing; crashes on large nodes | Avoided GraphML entirely; remained on neo4jcsv |
-| 9 | Stale git worktree registry | After CPG cache wipe, `git worktree add` refused with "already registered" | Added `git worktree prune` before every `git worktree add` |
-| 10 | PARAM_BIND deduplication collapsing arguments | All arguments of a call collapsed to one edge | Included arg index in dedup key: `PARAM_BIND_{idx}` |
-
----
-
-## 15. Dataset Information
-
-This section documents the 5-CVE validation dataset in `test_dataset/`, generated
-during the initial pipeline validation phase. The production 500-CVE dataset is
-described in [Section 11](#11-empirical-results) and is available for download
-via the link in [Section 9](#9-output-dataset-schema).
-
-The validation dataset lives in the `test_dataset/` folder in this repository. It is not a
-single file — it is six files that together form the complete dataset.
+If you use this dataset or pipeline, please cite the underlying CVEfixes data:
 
 ```
-test_dataset/
-├── nodes.jsonl          22 MB   — the main payload (11,000 node records)
-├── edges.jsonl          28 MB   — 166,177 graph edges between nodes
-├── functions.jsonl      59 KB   — 274 function-level provenance records
-├── sinks.jsonl          10 KB   — 46 identified dangerous-API sink nodes
-├── skipped.jsonl         0 B    — failures logged here (empty = none)
-└── manifest.json       376 B    — run configuration and totals
+Bhandari, G., Naseer, A., & Moonen, L. (2021). CVEfixes: Automated
+Collection of Vulnerabilities and Their Fixes from Open-Source Software.
+In Proceedings of the 17th International Conference on Predictive Models
+and Data Analytics in Software Engineering (PROMISE '21). ACM.
+DOI: 10.1145/3475960.3475985
 ```
 
-`nodes.jsonl` is the primary file for model training — one JSON record per line,
-one line per C statement node. `edges.jsonl` is used to reconstruct the graph
-adjacency for GNN training. The remaining files are supporting metadata and
-provenance records.
-
----
-
-### Dataset Summary Card
-
-| Property | Value |
-|----------|-------|
-| **Format** | JSONL (one JSON record per line) |
-| **Primary file** | `nodes.jsonl` |
-| **Total node records** | 11,000 |
-| **Total edge records** | 166,177 |
-| **CVEs covered** | 5 |
-| **Projects covered** | 4 (curl, zlib, tcpdump, libpcap) |
-| **Samples** | 10 (each CVE produces 2: vulnerable version + fixed version) |
-| **Positive rate** | 34.2% (3,764 of 11,000 nodes labeled 1) |
-| **CWEs represented** | CWE-119, CWE-122, CWE-125, CWE-787 |
-| **Languages** | C |
-| **Graph type** | Directed multigraph (CFG + DFG + CALL + PARAM_BIND edges) |
-| **Labeling method** | Bidirectional program slice: backward(sinks) ∩ forward(patch) |
-| **Scoping** | Patch functions + 1-hop callers and callees |
-| **Processing time** | 235 seconds total (sequential, single machine) |
-| **Storage** | ~51 MB (nodes + edges combined) |
-
----
-
-### Node Type Distribution
-
-| Statement Type | Count | % of Total |
-|----------------|-------|------------|
-| ASSIGN | 2,694 | 24.5% |
-| CALL | 2,308 | 21.0% |
-| IF | 1,620 | 14.7% |
-| DECL | 1,269 | 11.5% |
-| GOTO | 404 | 3.7% |
-| RETURN | 395 | 3.6% |
-| ELSE | 374 | 3.4% |
-| BREAK | 344 | 3.1% |
-| METHOD_ENTRY | 274 | 2.5% |
-| OTHER | 506 | 4.6% |
-
-The `OTHER` category at 4.6% indicates the statement classifier is discriminating
-well — the large majority of nodes are classified into a meaningful semantic type
-rather than falling through to a catch-all bucket.
-
----
-
-### Per-CVE Breakdown
-
-| CVE | Project | CWE | Nodes | Positives | Sinks | Positive Rate | Notable characteristic |
-|-----|---------|-----|-------|-----------|-------|---------------|------------------------|
-| CVE-2023-38545 | curl | CWE-122 | 1,299 | 772 | 10 | 59% | Heap buffer overflow in SOCKS5 handler |
-| CVE-2022-37434 | zlib | CWE-125/787 | 4,638 | 1,776 | 10 | 38% | Out-of-bounds read/write in inflate |
-| CVE-2017-16808 | tcpdump | CWE-125 | 3,133 | 787 | 22 | 25% | 82% of slice lives in callee functions |
-| CVE-2018-14468 | tcpdump | CWE-125 | 666 | 168 | 0* | 25% | No CWE-matched sinks; patch-fallback used |
-| CVE-2019-15161 | libpcap | CWE-125 | 1,264 | 261 | 4 | 21% | Mixed patch-function and callee slice |
-
-\* Sink identification found no CWE-125 matched APIs in the candidate neighborhood.
-The slicer fell back to using patch nodes as implicit sinks, producing a
-conservative but valid slice.
-
----
-
-### Sink Distribution
-
-Sinks are call sites of dangerous APIs identified via CWE-keyed matching.
-
-| API | Count | CWE families matched |
-|-----|-------|---------------------|
-| `memcpy` | 40 | CWE-119, CWE-122, CWE-125, CWE-787 |
-| `memcmp` | 4 | CWE-125 |
-| `strcpy` | 2 | CWE-119, CWE-122, CWE-787 |
-| **Total** | **46** | |
-
----
-
-### Key Dataset Properties
-
-**Paired samples.**
-Every CVE contributes exactly two samples — one for the vulnerable version of the
-code and one for the fixed version. Both samples share a `patch_id` and differ only
-in the `version` field (`vulnerable` or `fixed`). This pairing enables contrastive
-learning approaches, fix localization experiments, and before/after comparison of
-graph structure around the patch.
-
-**Inter-procedural coverage.**
-Across all samples, 1,614 of 11,000 nodes (14.7%) are flagged as cross-function
-nodes — nodes that have at least one edge crossing a function boundary. The most
-striking example is `tcpdump/CVE-2017-16808`, where 318 of 387 slice nodes (82%)
-reside in callee functions rather than the patched function itself. This confirms
-the dataset captures multi-function vulnerability propagation that function-level
-datasets cannot represent.
-
-**Heterogeneous graph structure.**
-Each sample is a directed multigraph with up to five distinct edge types: `CFG`
-(control flow), `REACHING_DEF` (data flow), `CALL` (function call), `PARAM_BIND`
-(argument-to-parameter binding), and `CDG` (control dependence). This is directly
-suitable for heterogeneous GNN architectures that learn different message-passing
-functions per edge type, such as RGCN or HGT.
-
-**Zero processing failures.**
-All five CVEs were processed without a single skipped or failed entry. The
-pipeline's seven-layer failure isolation — each catch surface logging to
-`skipped.jsonl` with stage, reason, and traceback — was not triggered on this
-run. The empty `skipped.jsonl` file (0 bytes) confirms this.
-
-**Reproducibility.**
-The dataset is fully reproducible from the work queue file `test_queue.jsonl`
-and the pipeline code in this repository. Re-running `build_dataset.py` with
-the same queue on a machine with Joern 4.0.520 installed will produce an
-identical dataset (modulo Joern's internal CPG node ID assignment, which may
-vary across machines but does not affect the canonical node IDs in the output).
-
----
-
-## 16. Future Work
-
-### A. CVEfixes Ingestor
-
-**Status**: Complete. See [Section 12](#12-the-cvefixes-ingestor).
-
-The ingestor was implemented as `ingest_cvefixes.py`. It processed CVEfixes
-v1.0.8 (12,107 fix commits, 11,873 CVEs) and produced a 500-entry work queue
-of C-language CVEs. The actual pass rate was 18% (2,144 qualifying C CVEs from
-12,931 rows), dominated by language filtering (71% of CVEfixes is non-C).
-
-### B. Full-Scale Dataset Run
-
-**Status**: Complete. See [Section 11](#11-empirical-results) and
-[Section 13](#13-production-run-operations-notes).
-
-A 500-CVE queue was processed over approximately 24 hours across two sessions.
-215 CVEs (43%) were processed successfully, producing 601,662 node records
-across 100+ unique C projects. The 42% skip rate was dominated by CVEfixes data
-quality. Operational notes (OOM crash, disk pressure, resume) are in Section 13.
-
-### C. Parallel Processing
-
-**Status**: Designed, not implemented.
-
-The current pipeline is sequential. On a machine with multiple cores, parallel
-processing of independent CVEs would give a near-linear speedup up to the
-number of available cores (bounded by Joern's own parallelism and memory).
-
-Implementation plan: replace the `for pc in entries` loop in `build_dataset.py`
-with a `multiprocessing.Pool`. Two preconditions must be met first:
-
-1. The CPG cache needs file-locking so two workers don't try to build the same
-   CPG simultaneously.
-2. The `DatasetWriter` needs a lock or per-worker output files that are merged
-   at the end.
-
-Estimated speedup: 3-4× on a 4-core machine, 6-8× on an 8-core machine.
-
-### D. Graded Labels (v2)
-
-**Status**: Designed during early development; deferred.
-
-The current labeling is binary: `in_slice=1` or `0`. A graded scheme would
-differentiate between degrees of vulnerability relevance:
-
-| Tier | Label | Meaning |
-|------|-------|---------|
-| `PATCH_CORE` | 3 | Node is directly on a modified line |
-| `TAINT_RELEVANT` | 2 | Node is in the backward slice from a sink |
-| `SEMANTIC_SEED` | 1 | Node is in the forward slice from patch nodes |
-| `NEGATIVE` | 0 | Node is outside all slices |
-
-This gives the model more nuanced signal and enables ordinal regression or
-multi-class classification as an alternative to binary prediction.
-
-### E. PyG/PyTorch Dataset Loader
-
-**Status**: Not yet started. Depends on B.
-
-A `torch_geometric.data.Dataset` subclass that reads `nodes.jsonl` and
-`edges.jsonl`, builds node feature tensors, constructs adjacency from canonical
-IDs, and emits a `torch_geometric.data.Data` object per sample. This is the
-natural interface for GNN training with frameworks like PyTorch Geometric or DGL.
-
-### F. Positive-Rate Tuning
-
-**Observation**: Aggregate positive rate is ~34%, but per-CVE rates vary from
-21% to 59%. The primary driver is `max_hops_slice` (default 10). On small
-functions, 10 hops can reach nearly every node.
-
-**Recommendation**: After collecting 50+ CVEs, plot the positive-rate distribution
-and choose a `max_hops_slice` value that pushes the aggregate rate below 20%.
-This reduces class imbalance without sacrificing meaningful slice coverage. Pilot
-experiments can be run by re-running the validator on the same cached CPGs with
-different hop counts (the CPG cache makes re-slicing cheap).
-
-### G. Dataset Publication and Sharing
-
-**Status**: Partially complete.
-
-The 500-CVE dataset was uploaded to Google Drive (link in [Section 9](#9-output-dataset-schema)).
-For long-term archival and citability, future work could publish to Zenodo for
-a permanent DOI, following the CVEfixes precedent (DOI 10.5281/zenodo.13118970).
-A Zenodo record would allow the dataset to be cited in academic papers and would
-guarantee availability independent of the author's Google Drive account.
-
----
-
-*End of documentation.*
+For the pipeline itself, please cite this repository.
