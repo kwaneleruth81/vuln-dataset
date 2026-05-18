@@ -8,14 +8,14 @@ The output is designed to support research on automated vulnerability detection 
 
 ## Dataset Download
 
-The current public release of this dataset (500-CVE production run) is hosted on Google Drive:
+The full 500-CVE production dataset is too large for GitHub (~1.7 GB) and is hosted on Google Drive:
 
-**[Download dataset_500/ from Google Drive →](https://drive.google.com/drive/folders/1q1oAQ-UOLeBM1aeSiABXtNddC0r8D8uC?usp=sharing)**
+**[Download dataset_500/ from Google Drive →](PASTE_YOUR_DRIVE_LINK_HERE)**
 
-The download contains six files totaling ~1.7 GB:
+The download contains six files:
 
 | File | Size | Content |
-|------|------|---------|
+| --- | --- | --- |
 | `nodes.jsonl` | 922 MB | 601,662 labeled node records (the main payload) |
 | `edges.jsonl` | 790 MB | 4,546,098 graph edges between nodes |
 | `functions.jsonl` | 5 MB | 23,294 function-level provenance records |
@@ -23,7 +23,7 @@ The download contains six files totaling ~1.7 GB:
 | `skipped.jsonl` | 183 KB | 338 records of CVEs that could not be processed |
 | `manifest.json` | 388 B | Run config and totals |
 
-Smaller provenance files (`functions.jsonl`, `sinks.jsonl`, `manifest.json`, `skipped.jsonl`) are also tracked in this repository under `dataset_500/` for inspection without downloading the full archive.
+The dataset files are not committed to this repository; download the archive from the link above to inspect them.
 
 ---
 
@@ -327,13 +327,11 @@ vulnerability-dataset/
 ├── smoke_test_step1.py             End-to-end smoke test on synthetic C
 ├── queue_500.jsonl                 The 500-CVE work queue
 ├── test_queue.jsonl                Hand-picked test queue (5 CVEs)
-└── dataset_500/
-    ├── manifest.json               Run config and totals
-    ├── functions.jsonl             Function-level provenance (committed to git)
-    ├── sinks.jsonl                 Sink records (committed to git)
-    ├── skipped.jsonl               Failed entries (committed to git)
-    ├── nodes.jsonl                 Main payload (Google Drive only)
-    └── edges.jsonl                 Edge records (Google Drive only)
+├── smoke_dataset/                  Output from a smoke-test run
+└── test_dataset/                   Output from the 5-CVE validation run
+
+Note: the full 500-CVE dataset (dataset_500/) is hosted on Google Drive
+(see "Dataset Download" above) — too large to commit to GitHub.
 ```
 
 ---
