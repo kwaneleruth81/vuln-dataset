@@ -10,7 +10,7 @@ The output is designed to support research on automated vulnerability detection 
 
 The full 500-CVE production dataset is too large for GitHub (~1.7 GB) and is hosted on Google Drive:
 
-**[Download dataset_500/ from Google Drive →](PASTE_YOUR_DRIVE_LINK_HERE)**
+**[Download dataset_500/ from Google Drive →](https://drive.google.com/drive/folders/1q1oAQ-UOLeBM1aeSiABXtNddC0r8D8uC?usp=sharing)**
 
 The download contains six files:
 
